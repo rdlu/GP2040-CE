@@ -217,6 +217,7 @@ enum class HttpStatusCode
     _200,
     _400,
     _500,
+    _503,
 };
 
 struct DataAndStatusCode
@@ -242,6 +243,33 @@ static const size_t HTTP_HEADER_RESERVE = 256;
 // free-list pointers before it goes out. Closed replies are parked here and
 // freed once no TCP segment references them any more.
 static std::vector<std::string*> retiredReplies;
+
+// The SDK's malloc panics (halting core0) instead of returning NULL, so heavy
+// handlers check the heap first and answer 503 rather than run out of memory.
+// Several requests can be open at once (the web UI fetches in parallel), and
+// each reply stays allocated until it has been acknowledged.
+static const size_t LARGE_REPLY_SIZE = 16 * 1024;       // only one such reply alive at a time
+static const size_t MIN_FREE_HEAP_FOR_HANDLER = 24 * 1024; // largest handler JSON doc + its reply
+static const size_t MIN_FREE_HEAP_AFTER_REPLY = 16 * 1024;
+static size_t liveLargeReplies = 0;
+
+static size_t freeHeap()
+{
+    const uint32_t total = System::getTotalHeap();
+    const uint32_t used = System::getUsedHeap();
+    return (total > used) ? (total - used) : 0;
+}
+
+static DataAndStatusCode busyReply()
+{
+    return DataAndStatusCode("{\"error\":\"busy\"}", HttpStatusCode::_503);
+}
+
+static void deleteReply(std::string* reply)
+{
+    if (reply->capacity() >= LARGE_REPLY_SIZE) --liveLargeReplies;
+    delete reply;
+}
 
 static bool pbufReferences(const struct pbuf* p, const char* lo, const char* hi)
 {
@@ -271,7 +299,7 @@ static void freeRetiredReplies()
         if (tcpReferences(retiredReplies[i])) {
             ++i;
         } else {
-            delete retiredReplies[i];
+            deleteReply(retiredReplies[i]);
             retiredReplies[i] = retiredReplies.back();
             retiredReplies.pop_back();
         }
@@ -286,6 +314,7 @@ int set_file_data(fs_file* file, DataAndStatusCode&& dataAndStatusCode)
         case HttpStatusCode::_200: statusCodeStr = "200 OK"; break;
         case HttpStatusCode::_400: statusCodeStr = "400 Bad Request"; break;
         case HttpStatusCode::_500: statusCodeStr = "500 Internal Server Error"; break;
+        case HttpStatusCode::_503: statusCodeStr = "503 Service Unavailable"; break;
     }
 
     std::string header;
@@ -316,6 +345,8 @@ int set_file_data(fs_file* file, DataAndStatusCode&& dataAndStatusCode)
         combined.append(*returnData);
         returnData->swap(combined);
     }
+
+    if (returnData->capacity() >= LARGE_REPLY_SIZE) ++liveLargeReplies;
 
     file->data = returnData->c_str();
     file->len = returnData->size();
@@ -2567,6 +2598,19 @@ std::string getConfig()
     return ConfigUtils::toJSON(Storage::getInstance().getConfig(), HTTP_HEADER_RESERVE);
 }
 
+DataAndStatusCode getConfigReply()
+{
+    // A full config is ~40-60 KB: build it only if no other large reply is
+    // still queued and it leaves headroom.
+    const size_t avail = freeHeap();
+    if (liveLargeReplies == 0 && avail > MIN_FREE_HEAP_AFTER_REPLY) {
+        std::string data = ConfigUtils::toJSON(Storage::getInstance().getConfig(), HTTP_HEADER_RESERVE,
+                                               avail - MIN_FREE_HEAP_AFTER_REPLY);
+        if (!data.empty()) return DataAndStatusCode(std::move(data), HttpStatusCode::_200);
+    }
+    return busyReply();
+}
+
 DataAndStatusCode setConfig()
 {
     // Store config struct on the heap to avoid stack overflow
@@ -2679,7 +2723,6 @@ static const std::pair<const char*, HandlerFuncPtr> handlerFuncs[] =
     { "/api/getHeldPins", getHeldPins },
     { "/api/abortGetHeldPins", abortGetHeldPins },
     { "/api/getUsedPins", getUsedPins },
-    { "/api/getConfig", getConfig },
 #if !defined(NDEBUG)
     { "/api/echo", echo },
 #endif
@@ -2689,6 +2732,7 @@ typedef DataAndStatusCode (*HandlerFuncStatusCodePtr)();
 static const std::pair<const char*, HandlerFuncStatusCodePtr> handlerFuncsWithStatusCode[] =
 {
     { "/api/setConfig", setConfig },
+    { "/api/getConfig", getConfigReply },
 };
 
 int fs_open_custom(struct fs_file *file, const char *name)
@@ -2699,6 +2743,7 @@ int fs_open_custom(struct fs_file *file, const char *name)
     {
         if (strcmp(handlerFunc.first, name) == 0)
         {
+            if (freeHeap() < MIN_FREE_HEAP_FOR_HANDLER) return set_file_data(file, busyReply());
             return set_file_data(file, handlerFunc.second());
         }
     }
@@ -2707,6 +2752,7 @@ int fs_open_custom(struct fs_file *file, const char *name)
     {
         if (strcmp(handlerFunc.first, name) == 0)
         {
+            if (freeHeap() < MIN_FREE_HEAP_FOR_HANDLER) return set_file_data(file, busyReply());
             return set_file_data(file, handlerFunc.second());
         }
     }
@@ -2730,6 +2776,11 @@ int fs_open_custom(struct fs_file *file, const char *name)
     }
 
     return 0;
+}
+
+void fs_release_custom(void)
+{
+    if (!retiredReplies.empty()) freeRetiredReplies();
 }
 
 void fs_close_custom(struct fs_file *file)

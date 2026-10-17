@@ -2,6 +2,7 @@
 #define CONFIG_UTILS_H
 
 #include "config.pb.h"
+#include <cstdint>
 #include <string>
 
 namespace ConfigUtils {
@@ -11,7 +12,8 @@ namespace ConfigUtils {
     void initUnsetPropertiesWithDefaults(Config& config);
 
     // headroom: extra capacity reserved so a caller can prepend data (e.g. HTTP headers) without reallocating
-    std::string toJSON(const Config& config, size_t headroom = 0);
+    // maxSize: if the buffer would need more than this many bytes, nothing is allocated and "" is returned
+    std::string toJSON(const Config& config, size_t headroom = 0, size_t maxSize = SIZE_MAX);
     bool fromJSON(Config& config, const char* data, size_t dataLen);
     bool fromLegacyStorage(Config& config);
 }
