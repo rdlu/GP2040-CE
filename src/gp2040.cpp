@@ -418,6 +418,13 @@ GP2040::BootAction GP2040::getBootAction() {
 					return BootAction::ENTER_USB_MODE;
 				} else if (!webConfigLocked && gamepad->pressedS2()) {
 					return BootAction::ENTER_WEBCONFIG_MODE;
+#if defined(GAMEPADII_TEST_BOOT_WEBCONFIG) && GAMEPADII_TEST_BOOT_WEBCONFIG
+				// TEST-ONLY build: a cold boot or reset without an explicit
+				// reboot mode goes to web-config, so a flash loop can reach the
+				// API unattended. /api/reboot {"bootMode":0} still boots gamepad.
+				} else if (!webConfigLocked) {
+					return BootAction::ENTER_WEBCONFIG_MODE;
+#endif
                 } else {
                     if (!modeSwitchLocked) {
                         if (auto search = bootActions.find(gamepad->state.buttons); search != bootActions.end()) {
