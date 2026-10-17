@@ -32,6 +32,7 @@
 #include "lwip/apps/httpd.h"
 #include "lwip/def.h"
 #include "lwip/mem.h"
+#include "lwip/priv/tcp_priv.h"
 #include "addons/input_macro.h"
 
 #define PATH_CGI_ACTION "/cgi/action"
@@ -233,6 +234,50 @@ struct DataAndStatusCode
 // Room handlers can reserve in their reply so the HTTP header is prepended in place.
 static const size_t HTTP_HEADER_RESERVE = 256;
 
+// httpd sends file data with tcp_write() without TCP_WRITE_FLAG_COPY, so the
+// queued segments point straight into the reply buffer. httpd closes the file
+// (fs_close_custom) as soon as the last byte has been queued, which is before
+// it has been transmitted, let alone acknowledged. Freeing the buffer there
+// lets malloc overwrite the start of the reply (the HTTP status line) with its
+// free-list pointers before it goes out. Closed replies are parked here and
+// freed once no TCP segment references them any more.
+static std::vector<std::string*> retiredReplies;
+
+static bool pbufReferences(const struct pbuf* p, const char* lo, const char* hi)
+{
+    for (; p != NULL; p = p->next) {
+        const char* payload = static_cast<const char*>(p->payload);
+        if (payload < hi && payload + p->len > lo) return true;
+    }
+    return false;
+}
+
+static bool tcpReferences(const std::string* reply)
+{
+    const char* lo = reply->data();
+    const char* hi = lo + reply->size();
+    for (const struct tcp_pcb* pcb = tcp_active_pcbs; pcb != NULL; pcb = pcb->next) {
+        for (const struct tcp_seg* seg = pcb->unsent; seg != NULL; seg = seg->next)
+            if (pbufReferences(seg->p, lo, hi)) return true;
+        for (const struct tcp_seg* seg = pcb->unacked; seg != NULL; seg = seg->next)
+            if (pbufReferences(seg->p, lo, hi)) return true;
+    }
+    return false;
+}
+
+static void freeRetiredReplies()
+{
+    for (size_t i = 0; i < retiredReplies.size();) {
+        if (tcpReferences(retiredReplies[i])) {
+            ++i;
+        } else {
+            delete retiredReplies[i];
+            retiredReplies[i] = retiredReplies.back();
+            retiredReplies.pop_back();
+        }
+    }
+}
+
 int set_file_data(fs_file* file, DataAndStatusCode&& dataAndStatusCode)
 {
     const char* statusCodeStr = "";
@@ -275,7 +320,8 @@ int set_file_data(fs_file* file, DataAndStatusCode&& dataAndStatusCode)
     file->data = returnData->c_str();
     file->len = returnData->size();
     file->index = file->len;
-    file->pextension = returnData; // freed in fs_close_custom()
+    file->http_header_included = 1;
+    file->pextension = returnData; // retired in fs_close_custom()
     file->is_custom_file = 1;
 
     return 1;
@@ -2647,6 +2693,8 @@ static const std::pair<const char*, HandlerFuncStatusCodePtr> handlerFuncsWithSt
 
 int fs_open_custom(struct fs_file *file, const char *name)
 {
+    freeRetiredReplies();
+
     for (const auto& handlerFunc : handlerFuncs)
     {
         if (strcmp(handlerFunc.first, name) == 0)
@@ -2688,7 +2736,9 @@ void fs_close_custom(struct fs_file *file)
 {
     if (file && file->is_custom_file && file->pextension)
     {
-        delete static_cast<std::string*>(file->pextension);
+        // Still queued in lwIP: free it once sent and acknowledged.
+        retiredReplies.push_back(static_cast<std::string*>(file->pextension));
         file->pextension = NULL;
+        freeRetiredReplies();
     }
 }
