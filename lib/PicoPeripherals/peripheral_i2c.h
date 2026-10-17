@@ -2,6 +2,8 @@
 #define _PERIPHERAL_I2C_H_
 
 #include <map>
+#include <atomic>
+#include <pico/mutex.h>
 #include <hardware/gpio.h>
 #include <hardware/i2c.h>
 #include <hardware/platform_defs.h>
@@ -64,6 +66,11 @@ public:
     // if this is set to anything other than -1, any r/w operations against the address other than test()/scan() will not be processed
     void setExclusiveUse(int8_t address = -1) { _exclusiveAddress = address; }
 private:
+    mutex_t _mutex;
+    std::atomic<bool> _inputPending{false};
+    void lock();
+    void unlock();
+
     const uint32_t DEFAULT_SPEED = 400000;
 
     uint8_t _SDA;
