@@ -44,6 +44,11 @@ execute_process(COMMAND ${GIT_EXECUTABLE} describe --always --abbrev=7
 	OUTPUT_STRIP_TRAILING_WHITESPACE)
 string(REGEX REPLACE "v([0-9]+\\.[0-9]+\\.[0-9]+).*" "\\1" CMAKE_GIT_REPO_VERSION ${GIT_REPO_VERSION})
 string(REGEX REPLACE "^(.......-.*)|(.......)$" "0.0.0" CMAKE_GIT_REPO_VERSION ${CMAKE_GIT_REPO_VERSION}) # fix if all we have is the git SHA
+option(GAMEPADII_TEST_BOOT_WEBCONFIG "TEST ONLY: boot to web-config unless an explicit reboot mode is set" OFF)
+if(GAMEPADII_TEST_BOOT_WEBCONFIG)
+  string(APPEND GIT_REPO_VERSION "-testboot")
+  add_compile_definitions(GAMEPADII_TEST_BOOT_WEBCONFIG=1)
+endif()
 configure_file("headers/version.h.in" "headers/version.h")
 message("GIT_REPO_VERSION is ${GIT_REPO_VERSION}")
 message("CMAKE_GIT_REPO_VERSION is ${CMAKE_GIT_REPO_VERSION}")
