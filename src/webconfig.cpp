@@ -230,10 +230,11 @@ struct DataAndStatusCode
 };
 
 // **** WEB SERVER Overrides and Special Functionality ****
-int set_file_data(fs_file* file, const DataAndStatusCode& dataAndStatusCode)
-{
-    static string returnData;
+// Room handlers can reserve in their reply so the HTTP header is prepended in place.
+static const size_t HTTP_HEADER_RESERVE = 256;
 
+int set_file_data(fs_file* file, DataAndStatusCode&& dataAndStatusCode)
+{
     const char* statusCodeStr = "";
     switch (dataAndStatusCode.statusCode)
     {
@@ -242,25 +243,40 @@ int set_file_data(fs_file* file, const DataAndStatusCode& dataAndStatusCode)
         case HttpStatusCode::_500: statusCodeStr = "500 Internal Server Error"; break;
     }
 
-    returnData.clear();
-    returnData.append("HTTP/1.0 ");
-    returnData.append(statusCodeStr);
-    returnData.append("\r\n");
-    returnData.append(
+    std::string header;
+    header.reserve(HTTP_HEADER_RESERVE);
+    header.append("HTTP/1.0 ");
+    header.append(statusCodeStr);
+    header.append("\r\n");
+    header.append(
         "Server: GP2040-CE " GP2040VERSION "\r\n"
         "Content-Type: application/json\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Content-Length: "
     );
-    returnData.append(std::to_string(dataAndStatusCode.data.length()));
-    returnData.append("\r\n\r\n");
-    returnData.append(dataAndStatusCode.data);
+    header.append(std::to_string(dataAndStatusCode.data.length()));
+    header.append("\r\n\r\n");
 
-    file->data = returnData.c_str();
-    file->len = returnData.size();
+    // One buffer per response: lwIP keeps sending from file->data after this
+    // returns, so a shared static buffer gets overwritten by the next request.
+    // Take over the body's buffer and prepend the header, so a large reply is
+    // not held in memory twice.
+    std::string* returnData = new std::string(std::move(dataAndStatusCode.data));
+    if (returnData->capacity() >= returnData->size() + header.size()) {
+        returnData->insert(0, header);
+    } else {
+        std::string combined;
+        combined.reserve(header.size() + returnData->size());
+        combined.append(header);
+        combined.append(*returnData);
+        returnData->swap(combined);
+    }
+
+    file->data = returnData->c_str();
+    file->len = returnData->size();
     file->index = file->len;
-    file->http_header_included = file->http_header_included;
-    file->pextension = NULL;
+    file->pextension = returnData; // freed in fs_close_custom()
+    file->is_custom_file = 1;
 
     return 1;
 }
@@ -406,6 +422,7 @@ void addUsedPinsArray(DynamicJsonDocument& doc)
 std::string serialize_json(DynamicJsonDocument &doc)
 {
     std::string data;
+    data.reserve(measureJson(doc) + HTTP_HEADER_RESERVE);
     serializeJson(doc, data);
     return data;
 }
@@ -2501,7 +2518,7 @@ std::string abortGetHeldPins()
 
 std::string getConfig()
 {
-    return ConfigUtils::toJSON(Storage::getInstance().getConfig());
+    return ConfigUtils::toJSON(Storage::getInstance().getConfig(), HTTP_HEADER_RESERVE);
 }
 
 DataAndStatusCode setConfig()
@@ -2671,7 +2688,7 @@ void fs_close_custom(struct fs_file *file)
 {
     if (file && file->is_custom_file && file->pextension)
     {
-        mem_free(file->pextension);
+        delete static_cast<std::string*>(file->pextension);
         file->pextension = NULL;
     }
 }
