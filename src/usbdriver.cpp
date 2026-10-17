@@ -9,6 +9,10 @@
 #include "tusb.h"
 #include "drivermanager.h"
 
+#if defined(GP2040_CONTROL_CHANNEL) && GP2040_CONTROL_CHANNEL
+#include "controlchannel.h"
+#endif
+
 static bool usb_mounted;
 static bool usb_suspended;
 
@@ -65,6 +69,9 @@ void tud_resume_cb(void) {
 // Vendor Controlled XFER occured
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
                                 tusb_control_request_t const *request) {
+#if defined(GP2040_CONTROL_CHANNEL) && GP2040_CONTROL_CHANNEL
+	if (ControlChannel::matches(request)) return ControlChannel::handle(rhport, stage, request);
+#endif
 	return DriverManager::getInstance().getDriver()->vendor_control_xfer_cb(rhport, stage, request);
 }
 
