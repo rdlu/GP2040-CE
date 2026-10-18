@@ -16,6 +16,10 @@
 #include "enums.h"
 #include "helper.h"
 
+#if defined(GP2040_CONTROL_CHANNEL) && GP2040_CONTROL_CHANNEL
+#include "controlchannel.h"
+#endif
+
 #define FRAME_MAX 100
 #define AL_ROW	5
 #define AL_COL	8
@@ -318,6 +322,10 @@ void NeoPicoLEDAddon::setup() {
 	remainderOfButtonLedsCount = (ledOptions.caseRGBCount) % (buttonLedCount);
 
     alLinkageStartIndex = ledOptions.caseRGBIndex;
+
+#if defined(GP2040_CONTROL_CHANNEL) && GP2040_CONTROL_CHANNEL
+    ControlChannel::ledSetup();
+#endif
 }
 
 void NeoPicoLEDAddon::ambientLightCustom() {
@@ -540,6 +548,10 @@ void NeoPicoLEDAddon::process() {
             neoPLEDs->animate(animationState);
         }
     }
+
+#if defined(GP2040_CONTROL_CHANNEL) && GP2040_CONTROL_CHANNEL
+    ControlChannel::ledProcess(as);
+#endif
 
     if ( action != HOTKEY_LEDS_NONE ) {
         as.HandleEvent(action);

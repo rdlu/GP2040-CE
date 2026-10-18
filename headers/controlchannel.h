@@ -14,6 +14,8 @@
 #include <stdint.h>
 #include "tusb.h"
 
+class AnimationStation;
+
 namespace ControlChannel {
     // True when the request is addressed to the channel. Stateless, so it can
     // be re-run on the stored request in the DATA and ACK stages.
@@ -21,6 +23,10 @@ namespace ControlChannel {
 
     // Handles a matched request in any stage. false STALLs EP0.
     bool handle(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request);
+
+    // Called on core1 by NeoPicoLEDAddon, which owns AnimationStation.
+    void ledSetup();
+    void ledProcess(AnimationStation &as);
 }
 
 #endif
