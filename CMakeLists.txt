@@ -388,6 +388,12 @@ target_include_directories(${PROJECT_NAME}  PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/.. # for our common lwipopts or any other standard includes, if required
   )
 
+option(GP2040_CONTROL_CHANNEL "Answer the USB vendor control channel (bRequest 0x47, wIndex 0x50nn)" OFF)
+if(GP2040_CONTROL_CHANNEL)
+  target_sources(${PROJECT_NAME} PRIVATE src/controlchannel.cpp)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE GP2040_CONTROL_CHANNEL=1)
+endif()
+
 pico_add_extra_outputs(${PROJECT_NAME})
 
 install(FILES
