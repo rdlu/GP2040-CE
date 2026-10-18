@@ -33,7 +33,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 6;
+constexpr uint8_t PROTO_MINOR = 7;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -56,6 +56,9 @@ constexpr uint32_t CONFIG_MAGIC      = 0xd2f1e365;
 // READ_CONFIG image: u32 size, u32 CRC-32, u32 most bytes WRITE_CONFIG can take, then the data
 constexpr uint16_t CONFIG_HEAD_LEN   = 12;
 constexpr uint16_t CONFIG_CHUNK_HEAD = 4;
+
+constexpr uint16_t INPUT_LEN       = 36;
+constexpr uint32_t SCAN_TIMEOUT_MS = 10000;
 static_assert(sizeof(GpioMappings::profileLabel) > SLOT_LABEL);
 
 enum Command : uint8_t {
@@ -66,6 +69,7 @@ enum Command : uint8_t {
     CMD_READ_SLOT      = 0x06,
     CMD_READ_LIGHTS    = 0x07,
     CMD_READ_CONFIG    = 0x08,
+    CMD_READ_INPUT     = 0x09,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
@@ -74,6 +78,7 @@ enum Command : uint8_t {
     CMD_WRITE_LIGHTS   = 0x16,
     CMD_WRITE_CONFIG   = 0x17,
     CMD_COMMIT_CONFIG  = 0x18,
+    CMD_PIN_SCAN       = 0x19,
 };
 
 enum Result : uint8_t {
@@ -97,9 +102,11 @@ enum Capability : uint32_t {
     CAP_SLOTS          = 1u << 10,
     CAP_LIGHTS_PROFILES = 1u << 11,
     CAP_CONFIG          = 1u << 12,
+    CAP_INPUT           = 1u << 13,
 };
 
-constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS | CAP_CONFIG;
+constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
+                                  CAP_CONFIG | CAP_INPUT;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -163,6 +170,11 @@ int8_t lightsProfileIndex = 0;
 uint8_t lightsProfileFlags = 0;
 AnimationProfile lightsProfile = {};
 
+// Pins that PIN_SCAN made inputs, and when the scan stops if READ_INPUT stops
+uint64_t scanPins = 0;
+bool scanActive = false;
+absolute_time_t scanDeadline;
+
 inline void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 inline void put32(uint8_t *p, uint32_t v) { put16(p, v & 0xffff); put16(p + 2, v >> 16); }
 inline uint16_t get16(const uint8_t *p) { return p[0] | (p[1] << 8); }
@@ -179,6 +191,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_READ_SLOT:
         case CMD_READ_LIGHTS:
         case CMD_READ_CONFIG:
+        case CMD_READ_INPUT:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
@@ -188,6 +201,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_WRITE_LIGHTS:
         case CMD_WRITE_CONFIG:
         case CMD_COMMIT_CONFIG:
+        case CMD_PIN_SCAN:
             return TUSB_DIR_OUT;
         default:
             return -1;
@@ -453,6 +467,74 @@ bool configWireValid(const uint8_t *data, uint32_t size) {
     return true;
 }
 
+// Like web-config's held pins: unassigned pins that nothing uses become inputs with a pull-up
+void startScan() {
+    const GpioMappingInfo *pins = Storage::getInstance().getProfilePinMappings();
+    for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        if (pins[pin].action == GpioAction::NONE && gpio_get_function(pin) == GPIO_FUNC_NULL) {
+            gpio_init(pin);
+            gpio_set_dir(pin, GPIO_IN);
+            gpio_pull_up(pin);
+            scanPins |= uint64_t{1} << pin;
+        }
+    }
+    scanActive = true;
+    scanDeadline = make_timeout_time_ms(SCAN_TIMEOUT_MS);
+}
+
+void stopScan() {
+    // A profile change can give one of these pins an action; then the gamepad owns it
+    const GpioMappingInfo *pins = Storage::getInstance().getProfilePinMappings();
+    for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        if ((scanPins & (uint64_t{1} << pin)) && pins[pin].action <= 0) gpio_deinit(pin);
+    }
+    scanPins = 0;
+    scanActive = false;
+}
+
+uint16_t buildInput() {
+    if (scanActive) {
+        if (time_reached(scanDeadline)) stopScan();
+        else scanDeadline = make_timeout_time_ms(SCAN_TIMEOUT_MS);
+    }
+    const uint64_t all = (uint64_t{1} << NUM_BANK0_GPIOS) - 1;
+    uint64_t readable = 0;
+    for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        if (gpio_get_function(pin) == GPIO_FUNC_SIO && !gpio_is_dir_out(pin)) readable |= uint64_t{1} << pin;
+    }
+    const uint64_t pressed = ~gpio_get_all64() & all & readable;
+
+    memset(buffer, 0, INPUT_LEN);
+    put32(buffer, (uint32_t)pressed);
+    put32(buffer + 4, (uint32_t)(pressed >> 32));
+    put32(buffer + 8, (uint32_t)readable);
+    put32(buffer + 12, (uint32_t)(readable >> 32));
+    Gamepad *gamepad = Storage::getInstance().GetGamepad();
+    if (gamepad != nullptr) {
+        const GamepadState &st = gamepad->state;
+        buffer[16] = st.dpad;
+        put16(buffer + 18, st.aux);
+        put32(buffer + 20, st.buttons);
+        put16(buffer + 24, st.lx);
+        put16(buffer + 26, st.ly);
+        put16(buffer + 28, st.rx);
+        put16(buffer + 30, st.ry);
+        buffer[32] = st.lt;
+        buffer[33] = st.rt;
+    }
+    buffer[17] = scanActive ? 1 : 0;
+    return INPUT_LEN;
+}
+
+uint8_t doPinScan(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < 1) return RES_BAD_LENGTH;
+    if (arg[0] > 1) return RES_BAD_ARG;
+    if (arg[0] && !scanActive) startScan();
+    else if (!arg[0] && scanActive) stopScan();
+    else if (arg[0]) scanDeadline = make_timeout_time_ms(SCAN_TIMEOUT_MS);
+    return RES_OK;
+}
+
 uint8_t doSetProfile(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 2) return RES_BAD_LENGTH;
     const uint8_t profile = arg[0], persist = arg[1];
@@ -650,6 +732,7 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_WRITE_LIGHTS:   return doWriteLights(arg, argLen);
         case CMD_WRITE_CONFIG:   return doWriteConfig(arg, argLen);
         case CMD_COMMIT_CONFIG:  return doCommitConfig(arg, argLen);
+        case CMD_PIN_SCAN:       return doPinScan(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -683,6 +766,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_READ_SLOT: if (!buildSlot(request->wValue, &len)) return false; break;
             case CMD_READ_LIGHTS: if (!buildLights(request->wValue, &len)) return false; break;
             case CMD_READ_CONFIG: if (!buildConfig(request->wValue, request->wLength, &len)) return false; break;
+            case CMD_READ_INPUT: len = buildInput(); break;
             default:
                 if (request->wLength < HEADER_LEN) {
                     lastCmd = cmd; lastSeq = 0; lastResult = RES_BAD_LENGTH;
