@@ -788,7 +788,8 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
 }
 
 void ControlChannel::lightsSetup() {
-    critical_section_init(&lightsLock);
+    // TinyUSB takes the free spin locks (24-31); with one more claim, a later claim panics at boot
+    critical_section_init_with_lock_num(&lightsLock, next_striped_spin_lock_num());
     lightsSaved = currentLights();
     EventManager::getInstance().registerEventHandler(GP_EVENT_STORAGE_SAVE, [](GPEvent *) { handleStorageSave(); });
     lightsRunning = true;
