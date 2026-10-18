@@ -406,6 +406,12 @@ GP2040::BootAction GP2040::getButtonMappedBootAction() {
 		bootAction.inputMode =  InputMode::INPUT_MODE_CONFIG;
 		return bootAction;
 	}
+#ifdef GAMEPADII_TEST_BOOT_WEBCONFIG
+	if (!webConfigLocked) {
+		bootAction.inputMode = InputMode::INPUT_MODE_CONFIG;
+		return bootAction;
+	}
+#endif
 	// input mask, action
 	std::map<uint32_t, int32_t> bootActions;
 
