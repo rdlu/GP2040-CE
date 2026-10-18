@@ -14,6 +14,8 @@
 #include "pb_encode.h"
 
 #include "BoardConfig.h"
+#include "CRC32.h"
+#include "FlashPROM.h"
 #include "animationstation.h"
 #include "config.pb.h"
 #include "enums.pb.h"
@@ -31,7 +33,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 5;
+constexpr uint8_t PROTO_MINOR = 6;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -46,6 +48,14 @@ constexpr uint16_t SLOT_LEN      = SLOT_HEAD_LEN + SLOT_PIN_LEN * NUM_BANK0_GPIO
 constexpr uint16_t LIGHTS_HEAD_LEN = 4;
 constexpr uint16_t LIGHTS_LEN      = LIGHTS_HEAD_LEN + AnimationProfile_size;
 constexpr uint16_t BUFFER_LEN      = HEADER_LEN + std::max(SLOT_LEN, LIGHTS_LEN);
+
+// The saved config is the protobuf data at the end of the FlashPROM block, then this footer
+// (ConfigFooter in config_utils.cpp): u32 data size, u32 CRC-32, u32 magic
+constexpr uint32_t CONFIG_FOOTER_LEN = 12;
+constexpr uint32_t CONFIG_MAGIC      = 0xd2f1e365;
+// READ_CONFIG image: u32 size, u32 CRC-32, u32 most bytes WRITE_CONFIG can take, then the data
+constexpr uint16_t CONFIG_HEAD_LEN   = 12;
+constexpr uint16_t CONFIG_CHUNK_HEAD = 4;
 static_assert(sizeof(GpioMappings::profileLabel) > SLOT_LABEL);
 
 enum Command : uint8_t {
@@ -55,12 +65,15 @@ enum Command : uint8_t {
     CMD_LIGHTS_STATUS  = 0x05,
     CMD_READ_SLOT      = 0x06,
     CMD_READ_LIGHTS    = 0x07,
+    CMD_READ_CONFIG    = 0x08,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
     CMD_SET_LIGHTS     = 0x14,
     CMD_WRITE_SLOT     = 0x15,
     CMD_WRITE_LIGHTS   = 0x16,
+    CMD_WRITE_CONFIG   = 0x17,
+    CMD_COMMIT_CONFIG  = 0x18,
 };
 
 enum Result : uint8_t {
@@ -83,9 +96,10 @@ enum Capability : uint32_t {
     CAP_LIGHTS         = 1u << 9,
     CAP_SLOTS          = 1u << 10,
     CAP_LIGHTS_PROFILES = 1u << 11,
+    CAP_CONFIG          = 1u << 12,
 };
 
-constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS;
+constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS | CAP_CONFIG;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -164,6 +178,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_LIGHTS_STATUS:
         case CMD_READ_SLOT:
         case CMD_READ_LIGHTS:
+        case CMD_READ_CONFIG:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
@@ -171,6 +186,8 @@ int commandDirection(uint8_t cmd) {
         case CMD_SET_LIGHTS:
         case CMD_WRITE_SLOT:
         case CMD_WRITE_LIGHTS:
+        case CMD_WRITE_CONFIG:
+        case CMD_COMMIT_CONFIG:
             return TUSB_DIR_OUT;
         default:
             return -1;
@@ -181,7 +198,9 @@ int commandDirection(uint8_t cmd) {
 uint16_t maxLength(uint8_t cmd) {
     switch (cmd) {
         case CMD_READ_SLOT:
-        case CMD_READ_LIGHTS:  return UINT16_MAX;
+        case CMD_READ_LIGHTS:
+        case CMD_READ_CONFIG:  return UINT16_MAX;
+        case CMD_WRITE_CONFIG: return BUFFER_LEN;
         case CMD_WRITE_SLOT:   return HEADER_LEN + SLOT_LEN;
         case CMD_WRITE_LIGHTS: return HEADER_LEN + LIGHTS_LEN;
         default:             return MAX_LEN;
@@ -394,6 +413,46 @@ bool colorsValid(const T &c) {
 
 inline bool cycleValid(int32_t step) { return step >= 0 && step < CYCLE_STEPS; }
 
+uint32_t savedConfigSize() {
+    const uint8_t *footer = EEPROM.writeCache + EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN;
+    const uint32_t size = get32(footer);
+    if (get32(footer + 8) != CONFIG_MAGIC || size > EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN) return 0;
+    return size;
+}
+
+// WRITE_CONFIG uses only the free start of the cache, so a save that waits for its flash write stays intact
+uint32_t configStageMax() { return EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN - savedConfigSize(); }
+
+bool buildConfig(uint16_t offset, uint16_t wLength, uint16_t *len) {
+    const uint32_t size = savedConfigSize();
+    const uint32_t imageLen = CONFIG_HEAD_LEN + size;
+    if (offset > imageLen) return false;
+    const uint8_t *data = EEPROM.writeCache + EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN - size;
+    uint8_t head[CONFIG_HEAD_LEN];
+    put32(head, size);
+    put32(head + 4, size ? get32(EEPROM.writeCache + EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN + 4) : 0);
+    put32(head + 8, configStageMax());
+    const uint16_t n = (uint16_t)std::min<uint32_t>({wLength, BUFFER_LEN, imageLen - offset});
+    for (uint16_t i = 0; i < n; i++) {
+        const uint32_t at = offset + i;
+        buffer[i] = at < CONFIG_HEAD_LEN ? head[at] : data[at - CONFIG_HEAD_LEN];
+    }
+    *len = n;
+    return true;
+}
+
+// A light check that the blob is protobuf: each top-level field has a valid tag and length
+bool configWireValid(const uint8_t *data, uint32_t size) {
+    pb_istream_t stream = pb_istream_from_buffer(data, size);
+    while (stream.bytes_left > 0) {
+        pb_wire_type_t type;
+        uint32_t tag;
+        bool eof;
+        if (!pb_decode_tag(&stream, &type, &tag, &eof) || tag == 0 || !pb_skip_field(&stream, type)) return false;
+    }
+    return true;
+}
+
 uint8_t doSetProfile(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 2) return RES_BAD_LENGTH;
     const uint8_t profile = arg[0], persist = arg[1];
@@ -522,6 +581,38 @@ uint8_t doWriteLights(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+uint8_t doWriteConfig(const uint8_t *arg, uint16_t argLen) {
+    if (argLen <= CONFIG_CHUNK_HEAD) return RES_BAD_LENGTH;
+    if (forcedLock(true)) return RES_LOCKED;
+    const uint32_t offset = get16(arg), n = argLen - CONFIG_CHUNK_HEAD;
+    if (get16(arg + 2) != 0 || offset + n > configStageMax()) return RES_BAD_ARG;
+    memcpy(EEPROM.writeCache + offset, arg + CONFIG_CHUNK_HEAD, n);
+    return RES_OK;
+}
+
+uint8_t doCommitConfig(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < 8) return RES_BAD_LENGTH;
+    if (forcedLock(true)) return RES_LOCKED;
+    const uint32_t size = get32(arg), crc = get32(arg + 4);
+    uint8_t *cache = EEPROM.writeCache;
+    // A save during the upload clears the free space, and then the CRC is different
+    if (size == 0 || size > configStageMax() || CRC32::calculate(cache, (uint16_t)size) != crc ||
+        !configWireValid(cache, size)) return RES_BAD_ARG;
+
+    // Put the blob where ConfigUtils::save() puts it. load() runs the migrations on the next boot
+    uint8_t *footer = cache + EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN;
+    memmove(footer - size, cache, size);
+    memset(cache, 0, EEPROM_SIZE_BYTES - CONFIG_FOOTER_LEN - size);
+    put32(footer, size);
+    put32(footer + 4, crc);
+    put32(footer + 8, CONFIG_MAGIC);
+    EEPROM.commit();
+    // The flash write waits EEPROM_WRITE_WAIT ms, and the reboot waits longer
+    EventManager::getInstance().triggerEvent(new GPRestartEvent(System::BootMode::GAMEPAD));
+    rebootPending = true;
+    return RES_OK;
+}
+
 uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 4) return RES_BAD_LENGTH;
     if (!lightsRunning) return RES_UNSUPPORTED;
@@ -557,6 +648,8 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_SET_LIGHTS:     return doSetLights(arg, argLen);
         case CMD_WRITE_SLOT:     return doWriteSlot(arg, argLen);
         case CMD_WRITE_LIGHTS:   return doWriteLights(arg, argLen);
+        case CMD_WRITE_CONFIG:   return doWriteConfig(arg, argLen);
+        case CMD_COMMIT_CONFIG:  return doCommitConfig(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -589,6 +682,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_LIGHTS_STATUS: if (!lightsRunning) return false; len = buildLightsStatus(); break;
             case CMD_READ_SLOT: if (!buildSlot(request->wValue, &len)) return false; break;
             case CMD_READ_LIGHTS: if (!buildLights(request->wValue, &len)) return false; break;
+            case CMD_READ_CONFIG: if (!buildConfig(request->wValue, request->wLength, &len)) return false; break;
             default:
                 if (request->wLength < HEADER_LEN) {
                     lastCmd = cmd; lastSeq = 0; lastResult = RES_BAD_LENGTH;
