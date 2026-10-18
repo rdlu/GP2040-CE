@@ -10,6 +10,8 @@
 #include "pico/critical_section.h"
 #include "pico/time.h"
 #include "pico/unique_id.h"
+#include "pb_decode.h"
+#include "pb_encode.h"
 
 #include "BoardConfig.h"
 #include "animationstation.h"
@@ -29,7 +31,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 4;
+constexpr uint8_t PROTO_MINOR = 5;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -40,7 +42,10 @@ constexpr uint16_t SLOT_HEAD_LEN = 20;
 constexpr uint16_t SLOT_PIN_LEN  = 10;
 constexpr uint16_t SLOT_LABEL    = 16;
 constexpr uint16_t SLOT_LEN      = SLOT_HEAD_LEN + SLOT_PIN_LEN * NUM_BANK0_GPIOS;
-constexpr uint16_t BUFFER_LEN    = HEADER_LEN + SLOT_LEN;
+// READ_LIGHTS reply and WRITE_LIGHTS argument: a 4-byte head, then an AnimationProfile protobuf
+constexpr uint16_t LIGHTS_HEAD_LEN = 4;
+constexpr uint16_t LIGHTS_LEN      = LIGHTS_HEAD_LEN + AnimationProfile_size;
+constexpr uint16_t BUFFER_LEN      = HEADER_LEN + std::max(SLOT_LEN, LIGHTS_LEN);
 static_assert(sizeof(GpioMappings::profileLabel) > SLOT_LABEL);
 
 enum Command : uint8_t {
@@ -49,11 +54,13 @@ enum Command : uint8_t {
     CMD_STRING         = 0x03,
     CMD_LIGHTS_STATUS  = 0x05,
     CMD_READ_SLOT      = 0x06,
+    CMD_READ_LIGHTS    = 0x07,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
     CMD_SET_LIGHTS     = 0x14,
     CMD_WRITE_SLOT     = 0x15,
+    CMD_WRITE_LIGHTS   = 0x16,
 };
 
 enum Result : uint8_t {
@@ -75,6 +82,7 @@ enum Capability : uint32_t {
     CAP_SET_INPUT_MODE = 1u << 5,
     CAP_LIGHTS         = 1u << 9,
     CAP_SLOTS          = 1u << 10,
+    CAP_LIGHTS_PROFILES = 1u << 11,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS;
@@ -105,6 +113,7 @@ enum LightsFlag : uint8_t {
     LIGHTS_FLAG_RUNNING = 1u << 0,
     LIGHTS_FLAG_UNSAVED = 1u << 1,
     LIGHTS_FLAG_PREVIEW = 1u << 2,
+    LIGHTS_FLAG_PENDING = 1u << 3, // a change waits for the LED add-on on core1
 };
 
 enum LightsMask : uint8_t {
@@ -135,6 +144,10 @@ uint8_t lightsPendingMask = 0;
 bool lightsPendingPersist = false;
 LightsValues lightsPending = {};
 LightsValues lightsSaved = {};
+volatile bool lightsProfileValid = false;
+int8_t lightsProfileIndex = 0;
+uint8_t lightsProfileFlags = 0;
+AnimationProfile lightsProfile = {};
 
 inline void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 inline void put32(uint8_t *p, uint32_t v) { put16(p, v & 0xffff); put16(p + 2, v >> 16); }
@@ -150,12 +163,14 @@ int commandDirection(uint8_t cmd) {
         case CMD_STRING:
         case CMD_LIGHTS_STATUS:
         case CMD_READ_SLOT:
+        case CMD_READ_LIGHTS:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
         case CMD_SET_INPUT_MODE:
         case CMD_SET_LIGHTS:
         case CMD_WRITE_SLOT:
+        case CMD_WRITE_LIGHTS:
             return TUSB_DIR_OUT;
         default:
             return -1;
@@ -165,8 +180,10 @@ int commandDirection(uint8_t cmd) {
 // The host can't know the pin count before READ_SLOT, so its wLength isn't limited
 uint16_t maxLength(uint8_t cmd) {
     switch (cmd) {
-        case CMD_READ_SLOT:  return UINT16_MAX;
-        case CMD_WRITE_SLOT: return HEADER_LEN + SLOT_LEN;
+        case CMD_READ_SLOT:
+        case CMD_READ_LIGHTS:  return UINT16_MAX;
+        case CMD_WRITE_SLOT:   return HEADER_LEN + SLOT_LEN;
+        case CMD_WRITE_LIGHTS: return HEADER_LEN + LIGHTS_LEN;
         default:             return MAX_LEN;
     }
 }
@@ -223,7 +240,7 @@ uint16_t buildHello(uint16_t nonce) {
     put16(buffer + 4, nonce);
     buffer[6] = PROTO_MAJOR;
     buffer[7] = PROTO_MINOR;
-    put32(buffer + 8, CAPABILITIES | (lightsRunning ? CAP_LIGHTS : 0));
+    put32(buffer + 8, CAPABILITIES | (lightsRunning ? CAP_LIGHTS | CAP_LIGHTS_PROFILES : 0));
     put32(buffer + 12, sessionToken);
     put32(buffer + 16, BOOTABLE_MODES);
     return 20;
@@ -272,6 +289,7 @@ uint16_t buildLightsStatus() {
     uint8_t flags = LIGHTS_FLAG_RUNNING;
     if (v.profile != saved.profile || v.brightness != saved.brightness) flags |= LIGHTS_FLAG_UNSAVED;
     if (as.IsTestModeActive()) flags |= LIGHTS_FLAG_PREVIEW;
+    if (lightsPendingValid || lightsProfileValid) flags |= LIGHTS_FLAG_PENDING;
 
     uint8_t enabled = 0;
     for (int i = 0; i < MAX_ANIMATION_PROFILES; i++) {
@@ -352,6 +370,29 @@ bool buildSlot(uint16_t profile, uint16_t *len) {
     *len = SLOT_LEN;
     return true;
 }
+
+bool buildLights(uint16_t profile, uint16_t *len) {
+    if (!lightsRunning || profile >= MAX_ANIMATION_PROFILES) return false;
+    const AnimationProfile &p = Storage::getInstance().getAnimationOptions().profiles[profile];
+    pb_ostream_t stream = pb_ostream_from_buffer(buffer + LIGHTS_HEAD_LEN, AnimationProfile_size);
+    if (!pb_encode(&stream, AnimationProfile_fields, &p)) return false;
+    buffer[0] = (uint8_t)profile;
+    buffer[1] = (p.bEnabled ? SLOT_ENABLED : 0) | (AnimationStation::getInstance().GetSavedMode() == profile ? SLOT_ACTIVE : 0);
+    put16(buffer + 2, (uint16_t)stream.bytes_written);
+    *len = LIGHTS_HEAD_LEN + stream.bytes_written;
+    return true;
+}
+
+template <typename T>
+bool colorsValid(const T &c) {
+    const size_t count = colors.size() + customColors.size();
+    for (pb_size_t i = 0; i < c.size; i++) {
+        if (c.bytes[i] >= count) return false;
+    }
+    return true;
+}
+
+inline bool cycleValid(int32_t step) { return step >= 0 && step < CYCLE_STEPS; }
 
 uint8_t doSetProfile(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 2) return RES_BAD_LENGTH;
@@ -444,6 +485,43 @@ uint8_t doWriteSlot(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+uint8_t doWriteLights(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < LIGHTS_HEAD_LEN) return RES_BAD_LENGTH;
+    if (!lightsRunning) return RES_UNSUPPORTED;
+    const uint8_t profile = arg[0], flags = arg[1];
+    if (profile >= MAX_ANIMATION_PROFILES || (flags & ~SLOT_FLAGS_ALL) || get16(arg + 2) != 0) return RES_BAD_ARG;
+    AnimationStation &as = AnimationStation::getInstance();
+    if (as.IsTestModeActive() || lightsProfileValid) return RES_BUSY;
+    const bool enable = flags & SLOT_ENABLED;
+    if (!enable && ((flags & SLOT_ACTIVE) || as.GetSavedMode() == profile)) return RES_PROFILE_DISABLED;
+
+    // Check only the fields that the host sends: stored profiles can have colors out of range
+    static AnimationProfile sent;
+    sent = AnimationProfile_init_zero;
+    pb_istream_t stream = pb_istream_from_buffer(arg + LIGHTS_HEAD_LEN, argLen - LIGHTS_HEAD_LEN);
+    if (!pb_decode(&stream, AnimationProfile_fields, &sent)) return RES_BAD_ARG;
+    if (sent.baseNonPressedEffect < _AnimationNonPressedEffects_MIN || sent.baseNonPressedEffect > _AnimationNonPressedEffects_MAX ||
+        sent.baseCaseEffect < _AnimationNonPressedEffects_MIN || sent.baseCaseEffect > _AnimationNonPressedEffects_MAX ||
+        sent.basePressedEffect < _AnimationPressedEffects_MIN || sent.basePressedEffect > _AnimationPressedEffects_MAX ||
+        !cycleValid(sent.baseCycleTime) || !cycleValid(sent.basePressedCycleTime) || !cycleValid(sent.baseCaseCycleTime) ||
+        !colorsValid(sent.notPressedStaticColors) || !colorsValid(sent.pressedStaticColors) || !colorsValid(sent.nonButtonStaticColors))
+        return RES_BAD_ARG;
+
+    // Fields that the host leaves out keep their values. Core1 reads lightsProfile only while lightsProfileValid
+    lightsProfile = Storage::getInstance().getAnimationOptions().profiles[profile];
+    stream = pb_istream_from_buffer(arg + LIGHTS_HEAD_LEN, argLen - LIGHTS_HEAD_LEN);
+    if (!pb_decode_ex(&stream, AnimationProfile_fields, &lightsProfile, PB_DECODE_NOINIT)) return RES_BAD_ARG;
+    lightsProfile.bEnabled = enable;
+    lightsProfile.has_bEnabled = true;
+
+    critical_section_enter_blocking(&lightsLock);
+    lightsProfileIndex = (int8_t)profile;
+    lightsProfileFlags = flags;
+    lightsProfileValid = true;
+    critical_section_exit(&lightsLock);
+    return RES_OK;
+}
+
 uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 4) return RES_BAD_LENGTH;
     if (!lightsRunning) return RES_UNSUPPORTED;
@@ -478,6 +556,7 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_SET_INPUT_MODE: return doSetInputMode(arg, argLen);
         case CMD_SET_LIGHTS:     return doSetLights(arg, argLen);
         case CMD_WRITE_SLOT:     return doWriteSlot(arg, argLen);
+        case CMD_WRITE_LIGHTS:   return doWriteLights(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -509,6 +588,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_STRING: if (!buildString(request->wValue, &len)) return false; break;
             case CMD_LIGHTS_STATUS: if (!lightsRunning) return false; len = buildLightsStatus(); break;
             case CMD_READ_SLOT: if (!buildSlot(request->wValue, &len)) return false; break;
+            case CMD_READ_LIGHTS: if (!buildLights(request->wValue, &len)) return false; break;
             default:
                 if (request->wLength < HEADER_LEN) {
                     lastCmd = cmd; lastSeq = 0; lastResult = RES_BAD_LENGTH;
@@ -536,7 +616,25 @@ void ControlChannel::lightsSetup() {
     lightsRunning = true;
 }
 
+static void applyLightsProfile(AnimationStation &as) {
+    critical_section_enter_blocking(&lightsLock);
+    const int8_t index = lightsProfileIndex;
+    const uint8_t flags = lightsProfileFlags;
+    Storage::getInstance().getAnimationOptions().profiles[index] = lightsProfile;
+    lightsProfileValid = false;
+    critical_section_exit(&lightsLock);
+
+    // SetMode builds the effects again from the profile
+    if (!as.IsTestModeActive() && ((flags & SLOT_ACTIVE) || as.GetSavedMode() == index)) {
+        const bool profileChange = as.GetSavedMode() != index;
+        as.SetMode(index);
+        if (profileChange) EventManager::getInstance().triggerEvent(new GPLEDEvent(true, false, false, false, false));
+    }
+    if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(false));
+}
+
 void ControlChannel::lightsProcess(AnimationStation &as) {
+    if (lightsProfileValid) applyLightsProfile(as);
     if (!lightsPendingValid) return;
     critical_section_enter_blocking(&lightsLock);
     const uint8_t mask = lightsPendingMask;
