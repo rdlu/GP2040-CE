@@ -5,8 +5,12 @@
 #include "controlchannel.h"
 
 #include <algorithm>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
+#include "hardware/watchdog.h"
 #include "pico/critical_section.h"
 #include "pico/time.h"
 #include "pico/unique_id.h"
@@ -33,7 +37,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 7;
+constexpr uint8_t PROTO_MINOR = 8;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -59,6 +63,13 @@ constexpr uint16_t CONFIG_CHUNK_HEAD = 4;
 
 constexpr uint16_t INPUT_LEN       = 36;
 constexpr uint32_t SCAN_TIMEOUT_MS = 10000;
+
+constexpr uint16_t LOG_RECORDS     = 64;
+constexpr uint16_t LOG_DATA        = 24;
+constexpr uint16_t LOG_HEAD_LEN    = 12;
+constexpr uint32_t LOG_MAGIC       = 0x474c4f47;
+constexpr uint32_t LOG_EARLY_MS    = 10000;
+constexpr uint8_t  LOG_EARLY_MAX   = 3;
 static_assert(sizeof(GpioMappings::profileLabel) > SLOT_LABEL);
 
 enum Command : uint8_t {
@@ -70,6 +81,7 @@ enum Command : uint8_t {
     CMD_READ_LIGHTS    = 0x07,
     CMD_READ_CONFIG    = 0x08,
     CMD_READ_INPUT     = 0x09,
+    CMD_READ_LOG       = 0x0A,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
@@ -103,10 +115,11 @@ enum Capability : uint32_t {
     CAP_LIGHTS_PROFILES = 1u << 11,
     CAP_CONFIG          = 1u << 12,
     CAP_INPUT           = 1u << 13,
+    CAP_LOG             = 1u << 14,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
-                                  CAP_CONFIG | CAP_INPUT;
+                                  CAP_CONFIG | CAP_INPUT | CAP_LOG;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -148,6 +161,40 @@ struct LightsValues {
     uint8_t brightness;
 };
 
+enum LogCode : uint8_t {
+    LOG_BOOT     = 0x01,
+    LOG_PANIC    = 0x02,
+    LOG_COMMAND  = 0x03,
+    LOG_PROFILE  = 0x04,
+    LOG_SAVE     = 0x05,
+    LOG_RESTART  = 0x06,
+    LOG_ERROR    = 0x07,
+    LOG_USB_HOST = 0x08,
+};
+
+struct LogRecord {
+    uint32_t ms;
+    uint16_t boot;
+    uint8_t code;
+    uint8_t len;
+    uint8_t data[LOG_DATA];
+};
+static_assert(sizeof(LogRecord) == 32);
+
+// A soft reboot keeps RAM; check makes a power-on or a new build start a new log
+struct LogRing {
+    uint32_t magic;
+    uint32_t layout;
+    uint32_t next;
+    uint16_t boot;
+    uint8_t earlyPanics;
+    uint8_t reserved;
+    uint32_t check;
+    LogRecord records[LOG_RECORDS];
+};
+
+constexpr uint32_t LOG_LAYOUT = (LOG_RECORDS << 16) | sizeof(LogRecord);
+
 // tud_control_xfer() keeps this pointer until the transfer completes
 uint8_t buffer[BUFFER_LEN];
 
@@ -175,10 +222,53 @@ uint64_t scanPins = 0;
 bool scanActive = false;
 absolute_time_t scanDeadline;
 
+LogRing __uninitialized_ram(logRing);
+critical_section_t logLock;
+
 inline void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 inline void put32(uint8_t *p, uint32_t v) { put16(p, v & 0xffff); put16(p + 2, v >> 16); }
 inline uint16_t get16(const uint8_t *p) { return p[0] | (p[1] << 8); }
 inline uint32_t get32(const uint8_t *p) { return get16(p) | ((uint32_t)get16(p + 2) << 16); }
+
+inline uint32_t logCheck() { return logRing.magic ^ logRing.layout ^ logRing.next ^ logRing.boot ^ logRing.earlyPanics; }
+
+void logAddUnlocked(uint8_t code, const void *data, uint8_t len) {
+    LogRecord &r = logRing.records[logRing.next % LOG_RECORDS];
+    r.ms = to_ms_since_boot(get_absolute_time());
+    r.boot = logRing.boot;
+    r.code = code;
+    r.len = std::min<uint8_t>(len, LOG_DATA);
+    memset(r.data, 0, LOG_DATA);
+    memcpy(r.data, data, r.len);
+    logRing.next++;
+    logRing.check = logCheck();
+}
+
+void logAdd(uint8_t code, const void *data, uint8_t len) {
+    critical_section_enter_blocking(&logLock);
+    logAddUnlocked(code, data, len);
+    critical_section_exit(&logLock);
+}
+
+void logText(uint8_t code, const char *text) { logAdd(code, text, strnlen(text, LOG_DATA)); }
+
+uint8_t bootModeIndex(uint32_t mode) {
+    switch ((System::BootMode)mode) {
+        case System::BootMode::DEFAULT:   return 0;
+        case System::BootMode::GAMEPAD:   return 1;
+        case System::BootMode::WEBCONFIG: return 2;
+        case System::BootMode::USB:       return 3;
+        default:                          return 0xff;
+    }
+}
+
+void setResult(uint8_t cmd, uint16_t seq, uint8_t result) {
+    lastCmd = cmd;
+    lastSeq = seq;
+    lastResult = result;
+    const uint8_t data[4] = { cmd, result, (uint8_t)(seq & 0xff), (uint8_t)(seq >> 8) };
+    logAdd(LOG_COMMAND, data, sizeof(data));
+}
 
 inline uint8_t commandOf(tusb_control_request_t const *request) { return request->wIndex & 0xff; }
 
@@ -192,6 +282,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_READ_LIGHTS:
         case CMD_READ_CONFIG:
         case CMD_READ_INPUT:
+        case CMD_READ_LOG:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
@@ -213,7 +304,8 @@ uint16_t maxLength(uint8_t cmd) {
     switch (cmd) {
         case CMD_READ_SLOT:
         case CMD_READ_LIGHTS:
-        case CMD_READ_CONFIG:  return UINT16_MAX;
+        case CMD_READ_CONFIG:
+        case CMD_READ_LOG:     return UINT16_MAX;
         case CMD_WRITE_CONFIG: return BUFFER_LEN;
         case CMD_WRITE_SLOT:   return HEADER_LEN + SLOT_LEN;
         case CMD_WRITE_LIGHTS: return HEADER_LEN + LIGHTS_LEN;
@@ -526,6 +618,30 @@ uint16_t buildInput() {
     return INPUT_LEN;
 }
 
+// wValue is the low 16 bits of the first sequence number to read; older records are gone
+uint16_t buildLog(uint16_t from, uint16_t wLength) {
+    critical_section_enter_blocking(&logLock);
+    const uint32_t next = logRing.next;
+    const uint32_t oldest = next > LOG_RECORDS ? next - LOG_RECORDS : 0;
+    uint32_t first = (next & ~0xffffu) | from;
+    if (first > next) first = first >= 0x10000 ? first - 0x10000 : 0;
+    if (first < oldest) first = oldest;
+    const uint16_t room = (std::min(wLength, BUFFER_LEN) - LOG_HEAD_LEN) / sizeof(LogRecord);
+    const uint8_t count = std::min<uint32_t>(next - first, room);
+    for (uint8_t i = 0; i < count; i++) {
+        memcpy(buffer + LOG_HEAD_LEN + i * sizeof(LogRecord), &logRing.records[(first + i) % LOG_RECORDS], sizeof(LogRecord));
+    }
+    const uint16_t boot = logRing.boot;
+    critical_section_exit(&logLock);
+
+    put32(buffer, first);
+    put32(buffer + 4, next);
+    put16(buffer + 8, boot);
+    buffer[10] = sizeof(LogRecord);
+    buffer[11] = count;
+    return LOG_HEAD_LEN + count * sizeof(LogRecord);
+}
+
 uint8_t doPinScan(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 1) return RES_BAD_LENGTH;
     if (arg[0] > 1) return RES_BAD_ARG;
@@ -753,7 +869,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
     if (stage == CONTROL_STAGE_SETUP) {
         if (commandDirection(cmd) < 0 || request->wLength > maxLength(cmd)) {
             if (request->bmRequestType_bit.direction == TUSB_DIR_OUT) {
-                lastCmd = cmd; lastSeq = 0; lastResult = commandDirection(cmd) < 0 ? RES_UNSUPPORTED : RES_BAD_LENGTH;
+                setResult(cmd, 0, commandDirection(cmd) < 0 ? RES_UNSUPPORTED : RES_BAD_LENGTH);
             }
             return false;
         }
@@ -767,9 +883,10 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_READ_LIGHTS: if (!buildLights(request->wValue, &len)) return false; break;
             case CMD_READ_CONFIG: if (!buildConfig(request->wValue, request->wLength, &len)) return false; break;
             case CMD_READ_INPUT: len = buildInput(); break;
+            case CMD_READ_LOG: if (request->wLength < LOG_HEAD_LEN) return false; len = buildLog(request->wValue, request->wLength); break;
             default:
                 if (request->wLength < HEADER_LEN) {
-                    lastCmd = cmd; lastSeq = 0; lastResult = RES_BAD_LENGTH;
+                    setResult(cmd, 0, RES_BAD_LENGTH);
                     return false;
                 }
                 return tud_control_xfer(rhport, request, buffer, request->wLength);
@@ -778,9 +895,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
     }
 
     if (stage == CONTROL_STAGE_DATA && request->bmRequestType_bit.direction == TUSB_DIR_OUT) {
-        lastCmd = cmd;
-        lastSeq = get16(buffer + 4);
-        lastResult = runCommand(cmd, request->wLength);
+        setResult(cmd, get16(buffer + 4), runCommand(cmd, request->wLength));
         return lastResult == RES_OK;
     }
 
@@ -834,4 +949,74 @@ void ControlChannel::lightsProcess(AnimationStation &as) {
     if (profileChange || brightnessChange)
         EventManager::getInstance().triggerEvent(new GPLEDEvent(profileChange, false, false, false, brightnessChange));
     if (persist) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(false));
+}
+
+// Runs before main(): the watchdog scratch register still holds the boot mode
+__attribute__((constructor)) static void logSetup() {
+    critical_section_init_with_lock_num(&logLock, next_striped_spin_lock_num());
+    const bool kept = watchdog_caused_reboot() && logRing.magic == LOG_MAGIC && logRing.layout == LOG_LAYOUT &&
+                      logRing.check == logCheck();
+    if (!kept) {
+        memset(&logRing, 0, sizeof(logRing));
+        logRing.magic = LOG_MAGIC;
+        logRing.layout = LOG_LAYOUT;
+    } else {
+        logRing.boot++;
+    }
+
+    uint8_t data[LOG_DATA] = { (uint8_t)((kept ? 1 : 0) | (watchdog_caused_reboot() ? 2 : 0)),
+                               bootModeIndex(watchdog_hw->scratch[5]) };
+    const uint8_t versionLen = strnlen(GP2040VERSION, LOG_DATA - 2);
+    memcpy(data + 2, GP2040VERSION, versionLen);
+    logAddUnlocked(LOG_BOOT, data, 2 + versionLen);
+
+    EventManager &events = EventManager::getInstance();
+    events.registerEventHandler(GP_EVENT_PROFILE_CHANGE, [](GPEvent *e) {
+        const GPProfileChangeEvent *p = static_cast<GPProfileChangeEvent *>(e);
+        const uint8_t d[2] = { p->previousValue, p->currentValue };
+        logAdd(LOG_PROFILE, d, sizeof(d));
+    });
+    events.registerEventHandler(GP_EVENT_STORAGE_SAVE, [](GPEvent *e) {
+        const GPStorageSaveEvent *p = static_cast<GPStorageSaveEvent *>(e);
+        const uint8_t d[2] = { p->forceSave, p->restartAfterSave };
+        logAdd(LOG_SAVE, d, sizeof(d));
+    });
+    events.registerEventHandler(GP_EVENT_RESTART, [](GPEvent *e) {
+        const uint8_t d = bootModeIndex((uint32_t)static_cast<GPRestartEvent *>(e)->bootMode);
+        critical_section_enter_blocking(&logLock);
+        logRing.earlyPanics = 0;
+        logAddUnlocked(LOG_RESTART, &d, 1);
+        critical_section_exit(&logLock);
+    });
+    events.registerEventHandler(GP_EVENT_SYSTEM_ERROR, [](GPEvent *e) {
+        logText(LOG_ERROR, static_cast<GPSystemErrorEvent *>(e)->errorMessage.c_str());
+    });
+    for (GPEventType type : { GP_EVENT_USBHOST_MOUNT, GP_EVENT_USBHOST_UNMOUNT }) {
+        events.registerEventHandler(type, [](GPEvent *e) {
+            const GPUSBHostEvent *p = static_cast<GPUSBHostEvent *>(e);
+            const uint8_t d[6] = { e->eventType() == GP_EVENT_USBHOST_MOUNT, p->deviceAddress,
+                                   (uint8_t)(p->vendorID & 0xff), (uint8_t)(p->vendorID >> 8),
+                                   (uint8_t)(p->productID & 0xff), (uint8_t)(p->productID >> 8) };
+            logAdd(LOG_USB_HOST, d, sizeof(d));
+        });
+    }
+}
+
+// PICO_PANIC_FUNCTION: keep the message, then reboot. A pad that panics again and again soon after boot halts as before.
+extern "C" void __attribute__((noreturn)) gamepadiiPanic(const char *fmt, ...) {
+    char text[LOG_DATA + 1] = "panic";
+    if (fmt) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(text, sizeof(text), fmt, args);
+        va_end(args);
+    }
+    // No lock: the other core can hold it, and this core does not come back
+    logAddUnlocked(LOG_PANIC, text, strnlen(text, LOG_DATA));
+    if (to_ms_since_boot(get_absolute_time()) < LOG_EARLY_MS) logRing.earlyPanics++;
+    else logRing.earlyPanics = 0;
+    logRing.check = logCheck();
+    if (logRing.earlyPanics >= LOG_EARLY_MAX) _exit(1);
+    watchdog_reboot(0, 0, 0);
+    for (;;) __wfi();
 }
