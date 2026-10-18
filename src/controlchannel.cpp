@@ -37,7 +37,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 8;
+constexpr uint8_t PROTO_MINOR = 9;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -64,6 +64,9 @@ constexpr uint16_t CONFIG_CHUNK_HEAD = 4;
 constexpr uint16_t INPUT_LEN       = 36;
 constexpr uint32_t SCAN_TIMEOUT_MS = 10000;
 
+constexpr uint16_t COLORS_HEAD_LEN = 4;
+static_assert(COLORS_HEAD_LEN + 3 * MAX_CUSTOM_COLORS <= MAX_LEN);
+
 constexpr uint16_t LOG_RECORDS     = 64;
 constexpr uint16_t LOG_DATA        = 24;
 constexpr uint16_t LOG_HEAD_LEN    = 12;
@@ -82,6 +85,7 @@ enum Command : uint8_t {
     CMD_READ_CONFIG    = 0x08,
     CMD_READ_INPUT     = 0x09,
     CMD_READ_LOG       = 0x0A,
+    CMD_READ_CUSTOM_COLORS = 0x0B,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
@@ -91,6 +95,7 @@ enum Command : uint8_t {
     CMD_WRITE_CONFIG   = 0x17,
     CMD_COMMIT_CONFIG  = 0x18,
     CMD_PIN_SCAN       = 0x19,
+    CMD_WRITE_CUSTOM_COLORS = 0x1A,
 };
 
 enum Result : uint8_t {
@@ -116,6 +121,7 @@ enum Capability : uint32_t {
     CAP_CONFIG          = 1u << 12,
     CAP_INPUT           = 1u << 13,
     CAP_LOG             = 1u << 14,
+    CAP_CUSTOM_COLORS   = 1u << 15,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
@@ -216,6 +222,10 @@ volatile bool lightsProfileValid = false;
 int8_t lightsProfileIndex = 0;
 uint8_t lightsProfileFlags = 0;
 AnimationProfile lightsProfile = {};
+volatile bool lightsColorsValid = false;
+uint8_t lightsColorsCount = 0;
+bool lightsColorsPersist = false;
+uint32_t lightsColors[MAX_CUSTOM_COLORS] = {};
 
 // Pins that PIN_SCAN made inputs, and when the scan stops if READ_INPUT stops
 uint64_t scanPins = 0;
@@ -283,6 +293,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_READ_CONFIG:
         case CMD_READ_INPUT:
         case CMD_READ_LOG:
+        case CMD_READ_CUSTOM_COLORS:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
@@ -293,6 +304,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_WRITE_CONFIG:
         case CMD_COMMIT_CONFIG:
         case CMD_PIN_SCAN:
+        case CMD_WRITE_CUSTOM_COLORS:
             return TUSB_DIR_OUT;
         default:
             return -1;
@@ -365,7 +377,7 @@ uint16_t buildHello(uint16_t nonce) {
     put16(buffer + 4, nonce);
     buffer[6] = PROTO_MAJOR;
     buffer[7] = PROTO_MINOR;
-    put32(buffer + 8, CAPABILITIES | (lightsRunning ? CAP_LIGHTS | CAP_LIGHTS_PROFILES : 0));
+    put32(buffer + 8, CAPABILITIES | (lightsRunning ? CAP_LIGHTS | CAP_LIGHTS_PROFILES | CAP_CUSTOM_COLORS : 0));
     put32(buffer + 12, sessionToken);
     put32(buffer + 16, BOOTABLE_MODES);
     return 20;
@@ -414,7 +426,7 @@ uint16_t buildLightsStatus() {
     uint8_t flags = LIGHTS_FLAG_RUNNING;
     if (v.profile != saved.profile || v.brightness != saved.brightness) flags |= LIGHTS_FLAG_UNSAVED;
     if (as.IsTestModeActive()) flags |= LIGHTS_FLAG_PREVIEW;
-    if (lightsPendingValid || lightsProfileValid) flags |= LIGHTS_FLAG_PENDING;
+    if (lightsPendingValid || lightsProfileValid || lightsColorsValid) flags |= LIGHTS_FLAG_PENDING;
 
     uint8_t enabled = 0;
     for (int i = 0; i < MAX_ANIMATION_PROFILES; i++) {
@@ -811,6 +823,43 @@ uint8_t doCommitConfig(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+// All slots, also the ones past the count: AnimationStation uses all of them
+bool buildCustomColors(uint16_t *len) {
+    if (!lightsRunning) return false;
+    const AnimationOptions &options = Storage::getInstance().getAnimationOptions();
+    buffer[0] = options.customColors_count;
+    buffer[1] = MAX_CUSTOM_COLORS;
+    put16(buffer + 2, 0);
+    for (int i = 0; i < MAX_CUSTOM_COLORS; i++) {
+        const uint32_t c = options.customColors[i];
+        buffer[COLORS_HEAD_LEN + i * 3] = (c >> 16) & 0xff;
+        buffer[COLORS_HEAD_LEN + i * 3 + 1] = (c >> 8) & 0xff;
+        buffer[COLORS_HEAD_LEN + i * 3 + 2] = c & 0xff;
+    }
+    *len = COLORS_HEAD_LEN + 3 * MAX_CUSTOM_COLORS;
+    return true;
+}
+
+uint8_t doWriteCustomColors(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < COLORS_HEAD_LEN) return RES_BAD_LENGTH;
+    if (!lightsRunning) return RES_UNSUPPORTED;
+    const uint8_t count = arg[0], flags = arg[1];
+    if (count > MAX_CUSTOM_COLORS || (flags & ~SLOT_PERSIST) || get16(arg + 2) != 0) return RES_BAD_ARG;
+    if (argLen < COLORS_HEAD_LEN + 3 * count) return RES_BAD_LENGTH;
+    if (AnimationStation::getInstance().IsTestModeActive() || lightsColorsValid) return RES_BUSY;
+
+    critical_section_enter_blocking(&lightsLock);
+    for (int i = 0; i < MAX_CUSTOM_COLORS; i++) {
+        const uint8_t *c = arg + COLORS_HEAD_LEN + i * 3;
+        lightsColors[i] = i < count ? (c[0] << 16) | (c[1] << 8) | c[2] : 0;
+    }
+    lightsColorsCount = count;
+    lightsColorsPersist = flags & SLOT_PERSIST;
+    lightsColorsValid = true;
+    critical_section_exit(&lightsLock);
+    return RES_OK;
+}
+
 uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 4) return RES_BAD_LENGTH;
     if (!lightsRunning) return RES_UNSUPPORTED;
@@ -849,6 +898,7 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_WRITE_CONFIG:   return doWriteConfig(arg, argLen);
         case CMD_COMMIT_CONFIG:  return doCommitConfig(arg, argLen);
         case CMD_PIN_SCAN:       return doPinScan(arg, argLen);
+        case CMD_WRITE_CUSTOM_COLORS: return doWriteCustomColors(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -883,6 +933,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_READ_LIGHTS: if (!buildLights(request->wValue, &len)) return false; break;
             case CMD_READ_CONFIG: if (!buildConfig(request->wValue, request->wLength, &len)) return false; break;
             case CMD_READ_INPUT: len = buildInput(); break;
+            case CMD_READ_CUSTOM_COLORS: if (!buildCustomColors(&len)) return false; break;
             case CMD_READ_LOG: if (request->wLength < LOG_HEAD_LEN) return false; len = buildLog(request->wValue, request->wLength); break;
             default:
                 if (request->wLength < HEADER_LEN) {
@@ -927,7 +978,23 @@ static void applyLightsProfile(AnimationStation &as) {
     if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(false));
 }
 
+static void applyCustomColors(AnimationStation &as) {
+    AnimationOptions &options = Storage::getInstance().getAnimationOptions();
+    critical_section_enter_blocking(&lightsLock);
+    memcpy(options.customColors, lightsColors, sizeof(lightsColors));
+    options.customColors_count = lightsColorsCount;
+    const bool persist = lightsColorsPersist;
+    lightsColorsValid = false;
+    critical_section_exit(&lightsLock);
+
+    // The effects keep the colors that they got when SetMode built them
+    as.InitSettings();
+    if (!as.IsTestModeActive()) as.SetMode(as.GetSavedMode());
+    if (persist) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(false));
+}
+
 void ControlChannel::lightsProcess(AnimationStation &as) {
+    if (lightsColorsValid) applyCustomColors(as);
     if (lightsProfileValid) applyLightsProfile(as);
     if (!lightsPendingValid) return;
     critical_section_enter_blocking(&lightsLock);
