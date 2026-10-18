@@ -29,7 +29,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 2;
+constexpr uint8_t PROTO_MINOR = 3;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -270,11 +270,16 @@ uint16_t buildLightsStatus() {
 bool buildString(uint16_t id, uint16_t *len) {
     const char *s = nullptr;
     Storage &storage = Storage::getInstance();
+    char boardId[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
     switch (id) {
         case 0x01: s = GP2040VERSION; break;
         case 0x02: s = GP2040_BOARDCONFIG; break;
         case 0x03: s = BOARD_CONFIG_LABEL; break;
         case 0x04: s = GP2040CONFIG; break;
+        case 0x05:
+            pico_get_unique_board_id_string(boardId, sizeof(boardId));
+            s = boardId;
+            break;
         case 0x11: s = storage.getGpioMappings().profileLabel; break;
         case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: {
             const ProfileOptions &profiles = storage.getProfileOptions();
