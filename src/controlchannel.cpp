@@ -29,21 +29,31 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 3;
+constexpr uint8_t PROTO_MINOR = 4;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
 constexpr uint16_t MAX_STRING = 63;
+
+// READ_SLOT reply and WRITE_SLOT argument: a 20-byte head, then 10 bytes for each pin
+constexpr uint16_t SLOT_HEAD_LEN = 20;
+constexpr uint16_t SLOT_PIN_LEN  = 10;
+constexpr uint16_t SLOT_LABEL    = 16;
+constexpr uint16_t SLOT_LEN      = SLOT_HEAD_LEN + SLOT_PIN_LEN * NUM_BANK0_GPIOS;
+constexpr uint16_t BUFFER_LEN    = HEADER_LEN + SLOT_LEN;
+static_assert(sizeof(GpioMappings::profileLabel) > SLOT_LABEL);
 
 enum Command : uint8_t {
     CMD_HELLO          = 0x01,
     CMD_STATUS         = 0x02,
     CMD_STRING         = 0x03,
     CMD_LIGHTS_STATUS  = 0x05,
+    CMD_READ_SLOT      = 0x06,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
     CMD_SET_LIGHTS     = 0x14,
+    CMD_WRITE_SLOT     = 0x15,
 };
 
 enum Result : uint8_t {
@@ -64,9 +74,10 @@ enum Capability : uint32_t {
     CAP_REBOOT         = 1u << 3,
     CAP_SET_INPUT_MODE = 1u << 5,
     CAP_LIGHTS         = 1u << 9,
+    CAP_SLOTS          = 1u << 10,
 };
 
-constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE;
+constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -81,6 +92,13 @@ constexpr uint32_t BOOTABLE_MODES =
 enum StatusFlag : uint8_t {
     FLAG_PROFILE_PENDING = 1u << 0,
     FLAG_REBOOT_PENDING  = 1u << 1,
+};
+
+enum SlotFlag : uint8_t {
+    SLOT_ENABLED = 1u << 0, // WRITE_SLOT enables the profile
+    SLOT_ACTIVE  = 1u << 1, // WRITE_SLOT selects it now
+    SLOT_PERSIST = 1u << 2, // WRITE_SLOT only: save to flash
+    SLOT_FLAGS_ALL = 0x07,
 };
 
 enum LightsFlag : uint8_t {
@@ -101,7 +119,7 @@ struct LightsValues {
 };
 
 // tud_control_xfer() keeps this pointer until the transfer completes
-uint8_t buffer[MAX_LEN];
+uint8_t buffer[BUFFER_LEN];
 
 uint32_t sessionToken = 0;
 bool rebootPending = false;
@@ -131,15 +149,30 @@ int commandDirection(uint8_t cmd) {
         case CMD_STATUS:
         case CMD_STRING:
         case CMD_LIGHTS_STATUS:
+        case CMD_READ_SLOT:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
         case CMD_SET_INPUT_MODE:
         case CMD_SET_LIGHTS:
+        case CMD_WRITE_SLOT:
             return TUSB_DIR_OUT;
         default:
             return -1;
     }
+}
+
+// The host can't know the pin count before READ_SLOT, so its wLength isn't limited
+uint16_t maxLength(uint8_t cmd) {
+    switch (cmd) {
+        case CMD_READ_SLOT:  return UINT16_MAX;
+        case CMD_WRITE_SLOT: return HEADER_LEN + SLOT_LEN;
+        default:             return MAX_LEN;
+    }
+}
+
+inline bool fixedAction(GpioAction action) {
+    return action == GpioAction::RESERVED || action == GpioAction::ASSIGNED_TO_ADDON;
 }
 
 LightsValues currentLights() {
@@ -296,6 +329,30 @@ bool buildString(uint16_t id, uint16_t *len) {
     return true;
 }
 
+bool buildSlot(uint16_t profile, uint16_t *len) {
+    Storage &storage = Storage::getInstance();
+    const ProfileOptions &profiles = storage.getProfileOptions();
+    if (profile < 1 || profile > 6) return false;
+    const bool defined = profile == 1 || profile - 2u < profiles.gpioMappingsSets_count;
+    const GpioMappings &slot = profile == 1 ? storage.getGpioMappings() : profiles.gpioMappingsSets[profile - 2];
+
+    memset(buffer, 0, SLOT_LEN);
+    buffer[0] = (uint8_t)profile;
+    if (defined && (profile == 1 || slot.enabled)) buffer[1] |= SLOT_ENABLED;
+    if (storage.getGamepadOptions().profileNumber == profile) buffer[1] |= SLOT_ACTIVE;
+    buffer[2] = NUM_BANK0_GPIOS;
+    buffer[3] = SLOT_PIN_LEN;
+    memcpy(buffer + 4, slot.profileLabel, strnlen(slot.profileLabel, SLOT_LABEL));
+    for (Pin_t pin = 0; defined && pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        uint8_t *p = buffer + SLOT_HEAD_LEN + pin * SLOT_PIN_LEN;
+        put16(p, (uint16_t)(int16_t)slot.pins[pin].action);
+        put32(p + 2, slot.pins[pin].customButtonMask);
+        put32(p + 6, slot.pins[pin].customDpadMask);
+    }
+    *len = SLOT_LEN;
+    return true;
+}
+
 uint8_t doSetProfile(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 2) return RES_BAD_LENGTH;
     const uint8_t profile = arg[0], persist = arg[1];
@@ -335,6 +392,58 @@ uint8_t doSetInputMode(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+uint8_t doWriteSlot(const uint8_t *arg, uint16_t argLen) {
+    if (argLen != SLOT_LEN) return RES_BAD_LENGTH;
+    const uint8_t profile = arg[0], flags = arg[1];
+    if (profile < 2 || profile > 6 || (flags & ~SLOT_FLAGS_ALL) ||
+        arg[2] != NUM_BANK0_GPIOS || arg[3] != SLOT_PIN_LEN) return RES_BAD_ARG;
+    for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        const int16_t action = (int16_t)get16(arg + SLOT_HEAD_LEN + pin * SLOT_PIN_LEN);
+        if (action < _GpioAction_MIN || action > _GpioAction_MAX) return RES_BAD_ARG;
+    }
+
+    Storage &storage = Storage::getInstance();
+    ProfileOptions &profiles = storage.getProfileOptions();
+    const bool enable = flags & SLOT_ENABLED;
+    const bool select = flags & SLOT_ACTIVE;
+    if (!enable && (select || storage.getGamepadOptions().profileNumber == profile)) return RES_PROFILE_DISABLED;
+
+    // Configs from before profile 6 have only 4 slots
+    while (profiles.gpioMappingsSets_count < profile - 1u) {
+        GpioMappings &added = profiles.gpioMappingsSets[profiles.gpioMappingsSets_count++];
+        added = GpioMappings{};
+        added.pins_count = NUM_BANK0_GPIOS;
+    }
+
+    // Like web-config: pins that profile 1 reserves or gives to an add-on keep its action
+    GpioMappings &slot = profiles.gpioMappingsSets[profile - 2];
+    const GpioMappingInfo *core = storage.getGpioMappings().pins;
+    for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        const uint8_t *p = arg + SLOT_HEAD_LEN + pin * SLOT_PIN_LEN;
+        GpioMappingInfo &info = slot.pins[pin];
+        if (fixedAction(core[pin].action)) {
+            info.action = core[pin].action;
+            info.customButtonMask = 0;
+            info.customDpadMask = 0;
+        } else {
+            info.action = (GpioAction)(int16_t)get16(p);
+            info.customButtonMask = get32(p + 2);
+            info.customDpadMask = get32(p + 6);
+        }
+    }
+    slot.pins_count = NUM_BANK0_GPIOS;
+    memset(slot.profileLabel, 0, sizeof(slot.profileLabel));
+    memcpy(slot.profileLabel, arg + 4, strnlen((const char *)arg + 4, SLOT_LABEL));
+    slot.enabled = enable;
+
+    if (select) storage.setProfile(profile);
+    // The reinit in the main loop only runs when the profile number changes, so force it
+    Gamepad *gamepad = storage.GetGamepad();
+    if (gamepad != nullptr && storage.getGamepadOptions().profileNumber == profile) gamepad->lastReinitProfileNumber = 0;
+    if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
+    return RES_OK;
+}
+
 uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 4) return RES_BAD_LENGTH;
     if (!lightsRunning) return RES_UNSUPPORTED;
@@ -368,6 +477,7 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_REBOOT:         return doReboot(arg, argLen);
         case CMD_SET_INPUT_MODE: return doSetInputMode(arg, argLen);
         case CMD_SET_LIGHTS:     return doSetLights(arg, argLen);
+        case CMD_WRITE_SLOT:     return doWriteSlot(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -386,7 +496,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
     const uint8_t cmd = commandOf(request);
 
     if (stage == CONTROL_STAGE_SETUP) {
-        if (commandDirection(cmd) < 0 || request->wLength > MAX_LEN) {
+        if (commandDirection(cmd) < 0 || request->wLength > maxLength(cmd)) {
             if (request->bmRequestType_bit.direction == TUSB_DIR_OUT) {
                 lastCmd = cmd; lastSeq = 0; lastResult = commandDirection(cmd) < 0 ? RES_UNSUPPORTED : RES_BAD_LENGTH;
             }
@@ -398,6 +508,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_STATUS: len = buildStatus(); break;
             case CMD_STRING: if (!buildString(request->wValue, &len)) return false; break;
             case CMD_LIGHTS_STATUS: if (!lightsRunning) return false; len = buildLightsStatus(); break;
+            case CMD_READ_SLOT: if (!buildSlot(request->wValue, &len)) return false; break;
             default:
                 if (request->wLength < HEADER_LEN) {
                     lastCmd = cmd; lastSeq = 0; lastResult = RES_BAD_LENGTH;
