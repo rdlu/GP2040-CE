@@ -15,6 +15,10 @@
 #include "usbdriver.h"
 #include "enums.h"
 #include "helper.h"
+
+#ifdef GP2040_CONTROL_CHANNEL
+#include "controlchannel.h"
+#endif
 #include "animation.h"
 
 const std::string BUTTON_LABEL_UP = "Up";
@@ -259,6 +263,9 @@ void NeoPicoLEDAddon::setup() {
 	configureLEDs();
 
 	EventManager::getInstance().registerEventHandler(GP_EVENT_SYSTEM_REBOOT, GPEVENT_CALLBACK(this->handleSystemReboot(event)));
+#ifdef GP2040_CONTROL_CHANNEL
+	ControlChannel::lightsSetup();
+#endif
 
 	// Next Run
     nextRunTime = make_timeout_time_ms(0); // Reset timeout
@@ -323,6 +330,10 @@ void NeoPicoLEDAddon::process()
             neoPLEDs->animate(animationState);
         }
     }
+
+#ifdef GP2040_CONTROL_CHANNEL
+	ControlChannel::lightsProcess(AnimStation);
+#endif
 
 	//Check for button combos that change animation settings
 	GamepadHotkey action = ProcessAnimationHotkeys(gamepad);

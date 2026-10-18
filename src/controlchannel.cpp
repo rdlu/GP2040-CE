@@ -4,12 +4,15 @@
 
 #include "controlchannel.h"
 
+#include <algorithm>
 #include <string.h>
 
+#include "pico/critical_section.h"
 #include "pico/time.h"
 #include "pico/unique_id.h"
 
 #include "BoardConfig.h"
+#include "animationstation.h"
 #include "config.pb.h"
 #include "enums.pb.h"
 #include "drivermanager.h"
@@ -26,7 +29,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 0;
+constexpr uint8_t PROTO_MINOR = 2;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -36,9 +39,11 @@ enum Command : uint8_t {
     CMD_HELLO          = 0x01,
     CMD_STATUS         = 0x02,
     CMD_STRING         = 0x03,
+    CMD_LIGHTS_STATUS  = 0x05,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
+    CMD_SET_LIGHTS     = 0x14,
 };
 
 enum Result : uint8_t {
@@ -58,6 +63,7 @@ enum Capability : uint32_t {
     CAP_SET_PROFILE    = 1u << 2,
     CAP_REBOOT         = 1u << 3,
     CAP_SET_INPUT_MODE = 1u << 5,
+    CAP_LIGHTS         = 1u << 9,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE;
@@ -77,6 +83,23 @@ enum StatusFlag : uint8_t {
     FLAG_REBOOT_PENDING  = 1u << 1,
 };
 
+enum LightsFlag : uint8_t {
+    LIGHTS_FLAG_RUNNING = 1u << 0,
+    LIGHTS_FLAG_UNSAVED = 1u << 1,
+    LIGHTS_FLAG_PREVIEW = 1u << 2,
+};
+
+enum LightsMask : uint8_t {
+    LIGHTS_PROFILE    = 1u << 0,
+    LIGHTS_BRIGHTNESS = 1u << 1,
+    LIGHTS_MASK_ALL   = 0x03,
+};
+
+struct LightsValues {
+    int8_t profile;
+    uint8_t brightness;
+};
+
 // tud_control_xfer() keeps this pointer until the transfer completes
 uint8_t buffer[MAX_LEN];
 
@@ -85,6 +108,15 @@ bool rebootPending = false;
 uint16_t lastSeq = 0;
 uint8_t lastCmd = 0;
 uint8_t lastResult = RES_OK;
+
+// Shared with core1; lightsLock guards the pending request and lightsSaved
+volatile bool lightsRunning = false;
+critical_section_t lightsLock;
+volatile bool lightsPendingValid = false;
+uint8_t lightsPendingMask = 0;
+bool lightsPendingPersist = false;
+LightsValues lightsPending = {};
+LightsValues lightsSaved = {};
 
 inline void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 inline void put32(uint8_t *p, uint32_t v) { put16(p, v & 0xffff); put16(p + 2, v >> 16); }
@@ -98,14 +130,39 @@ int commandDirection(uint8_t cmd) {
         case CMD_HELLO:
         case CMD_STATUS:
         case CMD_STRING:
+        case CMD_LIGHTS_STATUS:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
         case CMD_SET_INPUT_MODE:
+        case CMD_SET_LIGHTS:
             return TUSB_DIR_OUT;
         default:
             return -1;
     }
+}
+
+LightsValues currentLights() {
+    return LightsValues{AnimationStation::getInstance().GetSavedMode(),
+                        (uint8_t)Storage::getInstance().getAnimationOptions().brightness};
+}
+
+void overlay(LightsValues &v, uint8_t mask, const LightsValues &with) {
+    if (mask & LIGHTS_PROFILE)    v.profile    = with.profile;
+    if (mask & LIGHTS_BRIGHTNESS) v.brightness = with.brightness;
+}
+
+void handleStorageSave() {
+    LightsValues now = currentLights();
+    critical_section_enter_blocking(&lightsLock);
+    lightsSaved = now;
+    critical_section_exit(&lightsLock);
+}
+
+bool profileEnabled(int8_t profile) {
+    if (profile == -1) return true;
+    return profile >= 0 && profile < MAX_ANIMATION_PROFILES &&
+           Storage::getInstance().getAnimationOptions().profiles[profile].bEnabled;
 }
 
 uint32_t makeToken() {
@@ -133,7 +190,7 @@ uint16_t buildHello(uint16_t nonce) {
     put16(buffer + 4, nonce);
     buffer[6] = PROTO_MAJOR;
     buffer[7] = PROTO_MINOR;
-    put32(buffer + 8, CAPABILITIES);
+    put32(buffer + 8, CAPABILITIES | (lightsRunning ? CAP_LIGHTS : 0));
     put32(buffer + 12, sessionToken);
     put32(buffer + 16, BOOTABLE_MODES);
     return 20;
@@ -165,6 +222,48 @@ uint16_t buildStatus() {
     buffer[8] = lastCmd;
     buffer[9] = lastResult;
     put32(buffer + 12, to_ms_since_boot(get_absolute_time()));
+    return 16;
+}
+
+uint16_t buildLightsStatus() {
+    Storage &storage = Storage::getInstance();
+    const AnimationOptions &options = storage.getAnimationOptions();
+    AnimationStation &as = AnimationStation::getInstance();
+
+    LightsValues v = currentLights();
+    critical_section_enter_blocking(&lightsLock);
+    if (lightsPendingValid) overlay(v, lightsPendingMask, lightsPending);
+    const LightsValues saved = lightsSaved;
+    critical_section_exit(&lightsLock);
+
+    uint8_t flags = LIGHTS_FLAG_RUNNING;
+    if (v.profile != saved.profile || v.brightness != saved.brightness) flags |= LIGHTS_FLAG_UNSAVED;
+    if (as.IsTestModeActive()) flags |= LIGHTS_FLAG_PREVIEW;
+
+    uint8_t enabled = 0;
+    for (int i = 0; i < MAX_ANIMATION_PROFILES; i++) {
+        if (options.profiles[i].bEnabled) enabled |= 1u << i;
+    }
+
+    memset(buffer, 0xff, 16);
+    buffer[0] = flags;
+    buffer[1] = (uint8_t)v.profile;
+    buffer[2] = enabled;
+    buffer[3] = MAX_ANIMATION_PROFILES;
+    buffer[4] = v.brightness;
+    buffer[5] = as.getBrightnessSteps();
+    buffer[6] = (uint8_t)std::min<uint32_t>(storage.getLedOptions().brightnessMaximum, 255);
+    if (v.profile >= 0 && v.profile < MAX_ANIMATION_PROFILES) {
+        const AnimationProfile &p = options.profiles[v.profile];
+        buffer[7] = (uint8_t)p.baseNonPressedEffect;
+        buffer[8] = (uint8_t)p.basePressedEffect;
+        buffer[9] = (uint8_t)p.baseCaseEffect;
+        buffer[10] = (uint8_t)std::clamp<int32_t>(p.baseCycleTime, 0, 254);
+        buffer[11] = (uint8_t)std::clamp<int32_t>(p.basePressedCycleTime, 0, 254);
+        buffer[12] = (uint8_t)std::clamp<int32_t>(p.baseCaseCycleTime, 0, 254);
+    }
+    buffer[13] = 0;
+    put16(buffer + 14, (uint16_t)std::min<uint32_t>(options.autoDisableTime / 1000, 0xffff));
     return 16;
 }
 
@@ -231,6 +330,29 @@ uint8_t doSetInputMode(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < 4) return RES_BAD_LENGTH;
+    if (!lightsRunning) return RES_UNSUPPORTED;
+    const uint8_t mask = arg[0], persist = arg[3];
+    const LightsValues want{(int8_t)arg[1], arg[2]};
+    if ((mask & ~LIGHTS_MASK_ALL) || persist > 1) return RES_BAD_ARG;
+    AnimationStation &as = AnimationStation::getInstance();
+    // A preview runs on the test profile and its changes are never saved
+    if (as.IsTestModeActive()) return RES_BUSY;
+    if ((mask & LIGHTS_PROFILE) && !profileEnabled(want.profile)) return RES_BAD_ARG;
+    if ((mask & LIGHTS_BRIGHTNESS) && want.brightness > as.getBrightnessSteps()) return RES_BAD_ARG;
+    if (mask == 0 && !persist) return RES_OK;
+
+    critical_section_enter_blocking(&lightsLock);
+    if (!lightsPendingValid) { lightsPendingMask = 0; lightsPendingPersist = false; }
+    overlay(lightsPending, mask, want);
+    lightsPendingMask |= mask;
+    lightsPendingPersist = lightsPendingPersist || persist;
+    lightsPendingValid = true;
+    critical_section_exit(&lightsLock);
+    return RES_OK;
+}
+
 uint8_t runCommand(uint8_t cmd, uint16_t len) {
     const uint8_t *arg = buffer + HEADER_LEN;
     const uint16_t argLen = len - HEADER_LEN;
@@ -240,6 +362,7 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_SET_PROFILE:    return doSetProfile(arg, argLen);
         case CMD_REBOOT:         return doReboot(arg, argLen);
         case CMD_SET_INPUT_MODE: return doSetInputMode(arg, argLen);
+        case CMD_SET_LIGHTS:     return doSetLights(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -269,6 +392,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_HELLO:  len = buildHello(request->wValue); break;
             case CMD_STATUS: len = buildStatus(); break;
             case CMD_STRING: if (!buildString(request->wValue, &len)) return false; break;
+            case CMD_LIGHTS_STATUS: if (!lightsRunning) return false; len = buildLightsStatus(); break;
             default:
                 if (request->wLength < HEADER_LEN) {
                     lastCmd = cmd; lastSeq = 0; lastResult = RES_BAD_LENGTH;
@@ -287,4 +411,34 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
     }
 
     return true;
+}
+
+void ControlChannel::lightsSetup() {
+    critical_section_init(&lightsLock);
+    lightsSaved = currentLights();
+    EventManager::getInstance().registerEventHandler(GP_EVENT_STORAGE_SAVE, [](GPEvent *) { handleStorageSave(); });
+    lightsRunning = true;
+}
+
+void ControlChannel::lightsProcess(AnimationStation &as) {
+    if (!lightsPendingValid) return;
+    critical_section_enter_blocking(&lightsLock);
+    const uint8_t mask = lightsPendingMask;
+    const bool persist = lightsPendingPersist;
+    const LightsValues v = lightsPending;
+    lightsPendingValid = false;
+    critical_section_exit(&lightsLock);
+
+    if (as.IsTestModeActive()) return;
+    AnimationOptions &options = Storage::getInstance().getAnimationOptions();
+    const bool profileChange = (mask & LIGHTS_PROFILE) && as.GetSavedMode() != v.profile;
+    const bool brightnessChange = (mask & LIGHTS_BRIGHTNESS) && options.brightness != v.brightness;
+    if (profileChange) as.SetMode(v.profile);
+    if (brightnessChange) {
+        options.brightness = v.brightness;
+        as.SetBrightnessStepValue(v.brightness);
+    }
+    if (profileChange || brightnessChange)
+        EventManager::getInstance().triggerEvent(new GPLEDEvent(profileChange, false, false, false, brightnessChange));
+    if (persist) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(false));
 }
