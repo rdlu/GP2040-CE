@@ -1221,7 +1221,7 @@ void ControlChannel::lightsSetup() {
     // TinyUSB takes the free spin locks (24-31); with one more claim, a later claim panics at boot
     critical_section_init_with_lock_num(&lightsLock, next_striped_spin_lock_num());
     lightsSaved = currentLights();
-    EventManager::getInstance().registerEventHandler(GP_EVENT_STORAGE_SAVE, [](GPEvent *) { handleStorageSave(); });
+    EventManager::getInstance().registerEventHandler(GP_EVENT_STORAGE_SAVE, [](GPEvent *) { handleStorageSave(); }, nullptr);
     lightsRunning = true;
 }
 
@@ -1318,22 +1318,22 @@ __attribute__((constructor)) static void logSetup() {
         const GPProfileChangeEvent *p = static_cast<GPProfileChangeEvent *>(e);
         const uint8_t d[2] = { p->previousValue, p->currentValue };
         logAdd(LOG_PROFILE, d, sizeof(d));
-    });
+    }, nullptr);
     events.registerEventHandler(GP_EVENT_STORAGE_SAVE, [](GPEvent *e) {
         const GPStorageSaveEvent *p = static_cast<GPStorageSaveEvent *>(e);
         const uint8_t d[2] = { p->forceSave, p->restartAfterSave };
         logAdd(LOG_SAVE, d, sizeof(d));
-    });
+    }, nullptr);
     events.registerEventHandler(GP_EVENT_RESTART, [](GPEvent *e) {
         const uint8_t d = bootModeIndex((uint32_t)static_cast<GPRestartEvent *>(e)->bootMode);
         critical_section_enter_blocking(&logLock);
         logRing.earlyPanics = 0;
         logAddUnlocked(LOG_RESTART, &d, 1);
         critical_section_exit(&logLock);
-    });
+    }, nullptr);
     events.registerEventHandler(GP_EVENT_SYSTEM_ERROR, [](GPEvent *e) {
         logText(LOG_ERROR, static_cast<GPSystemErrorEvent *>(e)->errorMessage.c_str());
-    });
+    }, nullptr);
     for (GPEventType type : { GP_EVENT_USBHOST_MOUNT, GP_EVENT_USBHOST_UNMOUNT }) {
         events.registerEventHandler(type, [](GPEvent *e) {
             const GPUSBHostEvent *p = static_cast<GPUSBHostEvent *>(e);
@@ -1341,7 +1341,7 @@ __attribute__((constructor)) static void logSetup() {
                                    (uint8_t)(p->vendorID & 0xff), (uint8_t)(p->vendorID >> 8),
                                    (uint8_t)(p->productID & 0xff), (uint8_t)(p->productID >> 8) };
             logAdd(LOG_USB_HOST, d, sizeof(d));
-        });
+        }, nullptr);
     }
 }
 

@@ -262,7 +262,7 @@ void NeoPicoLEDAddon::setup() {
 	AnimStation.InitSettings();
 	configureLEDs();
 
-	EventManager::getInstance().registerEventHandler(GP_EVENT_SYSTEM_REBOOT, GPEVENT_CALLBACK(this->handleSystemReboot(event)));
+	EventManager::getInstance().registerEventHandler(GP_EVENT_SYSTEM_REBOOT, GPEVENT_CALLBACK(this->handleSystemReboot(event)), this);
 #ifdef GP2040_CONTROL_CHANNEL
 	ControlChannel::lightsSetup();
 #endif
