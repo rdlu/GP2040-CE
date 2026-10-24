@@ -170,6 +170,11 @@ void Gamepad::setup()
 		}
 	}
 
+	loadHotkeys();
+}
+
+void Gamepad::loadHotkeys()
+{
 	// Define our hotkey array
 	hotkeys[0] = hotkeyOptions.hotkey01;
 	hotkeys[1] = hotkeyOptions.hotkey02;

@@ -14,6 +14,7 @@
 #include "pico/critical_section.h"
 #include "pico/time.h"
 #include "pico/unique_id.h"
+#include "pb_common.h"
 #include "pb_decode.h"
 #include "pb_encode.h"
 
@@ -24,6 +25,7 @@
 #include "config.pb.h"
 #include "enums.pb.h"
 #include "drivermanager.h"
+#include "drivers/keyboard/KeyboardDescriptors.h"
 #include "eventmanager.h"
 #include "storagemanager.h"
 #include "system.h"
@@ -37,7 +39,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 9;
+constexpr uint8_t PROTO_MINOR = 10;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -67,6 +69,17 @@ constexpr uint32_t SCAN_TIMEOUT_MS = 10000;
 constexpr uint16_t COLORS_HEAD_LEN = 4;
 static_assert(COLORS_HEAD_LEN + 3 * MAX_CUSTOM_COLORS <= MAX_LEN);
 
+// READ_KEYMAP reply and WRITE_KEYMAP argument: a 4-byte head, then a keycode for each KeyboardMapping field
+constexpr uint16_t KEYMAP_HEAD_LEN = 4;
+constexpr uint8_t  KEYMAP_KEYS     = 32;
+static_assert(KEYMAP_HEAD_LEN + KEYMAP_KEYS <= MAX_LEN);
+// READ_HOTKEYS reply and WRITE_HOTKEYS argument: a 4-byte head, then 8 bytes for each HotkeyEntry
+constexpr uint16_t HOTKEYS_HEAD_LEN = 4;
+constexpr uint8_t  HOTKEY_LEN       = 8;
+constexpr uint8_t  HOTKEYS          = 16;
+constexpr uint16_t HOTKEYS_LEN      = HOTKEYS_HEAD_LEN + HOTKEY_LEN * HOTKEYS;
+static_assert(HOTKEYS_LEN <= BUFFER_LEN - HEADER_LEN && _GamepadHotkey_MAX <= 0xff);
+
 constexpr uint16_t LOG_RECORDS     = 64;
 constexpr uint16_t LOG_DATA        = 24;
 constexpr uint16_t LOG_HEAD_LEN    = 12;
@@ -86,6 +99,8 @@ enum Command : uint8_t {
     CMD_READ_INPUT     = 0x09,
     CMD_READ_LOG       = 0x0A,
     CMD_READ_CUSTOM_COLORS = 0x0B,
+    CMD_READ_KEYMAP    = 0x0C,
+    CMD_READ_HOTKEYS   = 0x0D,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
@@ -96,6 +111,8 @@ enum Command : uint8_t {
     CMD_COMMIT_CONFIG  = 0x18,
     CMD_PIN_SCAN       = 0x19,
     CMD_WRITE_CUSTOM_COLORS = 0x1A,
+    CMD_WRITE_KEYMAP   = 0x1B,
+    CMD_WRITE_HOTKEYS  = 0x1C,
 };
 
 enum Result : uint8_t {
@@ -122,10 +139,12 @@ enum Capability : uint32_t {
     CAP_INPUT           = 1u << 13,
     CAP_LOG             = 1u << 14,
     CAP_CUSTOM_COLORS   = 1u << 15,
+    CAP_KEYMAP          = 1u << 16,
+    CAP_HOTKEYS         = 1u << 17,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
-                                  CAP_CONFIG | CAP_INPUT | CAP_LOG;
+                                  CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -294,6 +313,8 @@ int commandDirection(uint8_t cmd) {
         case CMD_READ_INPUT:
         case CMD_READ_LOG:
         case CMD_READ_CUSTOM_COLORS:
+        case CMD_READ_KEYMAP:
+        case CMD_READ_HOTKEYS:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
@@ -305,6 +326,8 @@ int commandDirection(uint8_t cmd) {
         case CMD_COMMIT_CONFIG:
         case CMD_PIN_SCAN:
         case CMD_WRITE_CUSTOM_COLORS:
+        case CMD_WRITE_KEYMAP:
+        case CMD_WRITE_HOTKEYS:
             return TUSB_DIR_OUT;
         default:
             return -1;
@@ -317,10 +340,12 @@ uint16_t maxLength(uint8_t cmd) {
         case CMD_READ_SLOT:
         case CMD_READ_LIGHTS:
         case CMD_READ_CONFIG:
+        case CMD_READ_HOTKEYS:
         case CMD_READ_LOG:     return UINT16_MAX;
         case CMD_WRITE_CONFIG: return BUFFER_LEN;
         case CMD_WRITE_SLOT:   return HEADER_LEN + SLOT_LEN;
         case CMD_WRITE_LIGHTS: return HEADER_LEN + LIGHTS_LEN;
+        case CMD_WRITE_HOTKEYS: return HEADER_LEN + HOTKEYS_LEN;
         default:             return MAX_LEN;
     }
 }
@@ -860,6 +885,103 @@ uint8_t doWriteCustomColors(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+// KeyboardDriver::pressKey() sends these; the fields are in tag order: the d-pad, then B1 to E12
+inline bool keycodeValid(uint8_t code) {
+    return code <= HID_KEY_GUI_RIGHT || code == KEYBOARD_MULTIMEDIA_NEXT_TRACK || code == KEYBOARD_MULTIMEDIA_PREV_TRACK ||
+           (code >= KEYBOARD_MULTIMEDIA_STOP && code <= KEYBOARD_MULTIMEDIA_VOLUME_DOWN);
+}
+
+uint16_t buildKeymap() {
+    pb_field_iter_t field;
+    uint8_t count = 0;
+    if (pb_field_iter_begin(&field, KeyboardMapping_fields, &Storage::getInstance().getKeyboardMapping())) {
+        do buffer[KEYMAP_HEAD_LEN + count++] = (uint8_t)*(const uint32_t *)field.pData;
+        while (count < KEYMAP_KEYS && pb_field_iter_next(&field));
+    }
+    buffer[0] = count;
+    buffer[1] = 0;
+    put16(buffer + 2, 0);
+    return KEYMAP_HEAD_LEN + count;
+}
+
+uint8_t doWriteKeymap(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < KEYMAP_HEAD_LEN) return RES_BAD_LENGTH;
+    const uint8_t count = arg[0], flags = arg[1];
+    if (count != KEYMAP_KEYS || (flags & ~SLOT_PERSIST) || get16(arg + 2) != 0) return RES_BAD_ARG;
+    if (argLen < KEYMAP_HEAD_LEN + count) return RES_BAD_LENGTH;
+    const uint8_t *keys = arg + KEYMAP_HEAD_LEN;
+    for (uint8_t i = 0; i < count; i++) {
+        if (!keycodeValid(keys[i])) return RES_BAD_ARG;
+    }
+
+    // KeyboardDriver reads the mapping for each report
+    pb_field_iter_t field;
+    uint8_t i = 0;
+    if (pb_field_iter_begin(&field, KeyboardMapping_fields, &Storage::getInstance().getKeyboardMapping())) {
+        do {
+            *(uint32_t *)field.pData = keys[i++];
+            *(bool *)field.pSize = true;
+        } while (i < count && pb_field_iter_next(&field));
+    }
+    if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
+    return RES_OK;
+}
+
+uint16_t buildHotkeys() {
+    pb_field_iter_t field;
+    uint8_t count = 0;
+    if (pb_field_iter_begin(&field, HotkeyOptions_fields, &Storage::getInstance().getHotkeyOptions())) {
+        do {
+            const HotkeyEntry &e = *(const HotkeyEntry *)field.pData;
+            uint8_t *p = buffer + HOTKEYS_HEAD_LEN + count++ * HOTKEY_LEN;
+            p[0] = (uint8_t)e.action;
+            p[1] = (uint8_t)e.dpadMask;
+            put16(p + 2, (uint16_t)e.auxMask);
+            put32(p + 4, e.buttonsMask);
+        } while (count < HOTKEYS && pb_field_iter_next(&field));
+    }
+    buffer[0] = count;
+    buffer[1] = 0;
+    buffer[2] = HOTKEY_LEN;
+    buffer[3] = 0;
+    return HOTKEYS_HEAD_LEN + count * HOTKEY_LEN;
+}
+
+uint8_t doWriteHotkeys(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < HOTKEYS_HEAD_LEN) return RES_BAD_LENGTH;
+    const uint8_t count = arg[0], flags = arg[1];
+    if (count > HOTKEYS || (flags & ~SLOT_PERSIST) || arg[2] != HOTKEY_LEN || arg[3] != 0) return RES_BAD_ARG;
+    if (argLen < HOTKEYS_HEAD_LEN + count * HOTKEY_LEN) return RES_BAD_LENGTH;
+    for (uint8_t i = 0; i < count; i++) {
+        const uint8_t *p = arg + HOTKEYS_HEAD_LEN + i * HOTKEY_LEN;
+        // Like web-config: the d-pad is in dpadMask, not in bits 16-19 of buttonsMask
+        if (p[0] > _GamepadHotkey_MAX || (p[1] & ~GAMEPAD_MASK_DPAD) || (get16(p + 2) & ~AUX_MASK_FUNCTION) ||
+            (get32(p + 4) & (GAMEPAD_MASK_DU | GAMEPAD_MASK_DD | GAMEPAD_MASK_DL | GAMEPAD_MASK_DR))) return RES_BAD_ARG;
+    }
+
+    // The entries after count become empty, so that RAM agrees with what a save writes
+    pb_field_iter_t field;
+    uint8_t i = 0;
+    if (pb_field_iter_begin(&field, HotkeyOptions_fields, &Storage::getInstance().getHotkeyOptions())) {
+        do {
+            const uint8_t *p = arg + HOTKEYS_HEAD_LEN + i * HOTKEY_LEN;
+            const bool sent = i++ < count;
+            HotkeyEntry &e = *(HotkeyEntry *)field.pData;
+            e.action = sent ? (GamepadHotkey)p[0] : HOTKEY_NONE;
+            e.dpadMask = sent ? p[1] : 0;
+            e.auxMask = sent ? get16(p + 2) : 0;
+            e.buttonsMask = sent ? get32(p + 4) : 0;
+            e.has_action = e.has_dpadMask = e.has_auxMask = e.has_buttonsMask = true;
+            *(bool *)field.pSize = true;
+        } while (i < HOTKEYS && pb_field_iter_next(&field));
+    }
+    // Gamepad::hotkey() uses the copy that setup() makes
+    Gamepad *gamepad = Storage::getInstance().GetGamepad();
+    if (gamepad != nullptr) gamepad->loadHotkeys();
+    if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
+    return RES_OK;
+}
+
 uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 4) return RES_BAD_LENGTH;
     if (!lightsRunning) return RES_UNSUPPORTED;
@@ -899,6 +1021,8 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_COMMIT_CONFIG:  return doCommitConfig(arg, argLen);
         case CMD_PIN_SCAN:       return doPinScan(arg, argLen);
         case CMD_WRITE_CUSTOM_COLORS: return doWriteCustomColors(arg, argLen);
+        case CMD_WRITE_KEYMAP:   return doWriteKeymap(arg, argLen);
+        case CMD_WRITE_HOTKEYS:  return doWriteHotkeys(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -934,6 +1058,8 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_READ_CONFIG: if (!buildConfig(request->wValue, request->wLength, &len)) return false; break;
             case CMD_READ_INPUT: len = buildInput(); break;
             case CMD_READ_CUSTOM_COLORS: if (!buildCustomColors(&len)) return false; break;
+            case CMD_READ_KEYMAP: len = buildKeymap(); break;
+            case CMD_READ_HOTKEYS: len = buildHotkeys(); break;
             case CMD_READ_LOG: if (request->wLength < LOG_HEAD_LEN) return false; len = buildLog(request->wValue, request->wLength); break;
             default:
                 if (request->wLength < HEADER_LEN) {

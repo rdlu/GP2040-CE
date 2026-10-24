@@ -40,6 +40,7 @@ public:
 	void save();
 
 	void hotkey();
+	void loadHotkeys();
 	void clearState();
 	void clearRumbleState();
 
