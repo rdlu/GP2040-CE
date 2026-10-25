@@ -18,7 +18,7 @@
 #define TURBO_SHOT_MAX 30
 
 // Hold the Turbo pin alone this long to toggle the display menu
-#define TURBO_MENU_HOLD_MS 3000
+#define TURBO_MENU_HOLD_MS 2000
 
 // TURBO Button Mask
 #define TURBO_BUTTON_MASK (GAMEPAD_MASK_B1 | GAMEPAD_MASK_B2 | GAMEPAD_MASK_B3 | GAMEPAD_MASK_B4 | \

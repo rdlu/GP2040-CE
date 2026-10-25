@@ -63,7 +63,7 @@ void MainMenuScreen::init() {
             case GpioAction::MENU_NAVIGATION_SELECT: mapMenuSelect->pinMask |= Mask_t{1} << pin; break;
             case GpioAction::MENU_NAVIGATION_BACK: mapMenuBack->pinMask |= Mask_t{1} << pin; break;
             case GpioAction::MENU_NAVIGATION_TOGGLE: mapMenuToggle->pinMask |= Mask_t{1} << pin; break;
-            // A 3 s Turbo hold opens the menu, a press closes it
+            // A Turbo hold opens the menu, a press closes it
             case GpioAction::BUTTON_PRESS_TURBO: mapMenuToggle->pinMask |= Mask_t{1} << pin; break;
             default:    break;
         }
