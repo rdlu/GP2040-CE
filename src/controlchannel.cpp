@@ -802,6 +802,9 @@ uint8_t doWriteSlot(const uint8_t *arg, uint16_t argLen) {
         GpioMappings &added = profiles.gpioMappingsSets[profiles.gpioMappingsSets_count++];
         added = GpioMappings{};
         added.pins_count = NUM_BANK0_GPIOS;
+        // Like web-config: a new profile starts with the base keyboard mapping
+        added.keyboardMapping = storage.getKeyboardMapping();
+        added.has_keyboardMapping = true;
     }
 
     // Like web-config: pins that profile 1 reserves or gives to an add-on keep its action
