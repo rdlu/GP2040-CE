@@ -24,6 +24,22 @@
 #define TURBO_BUTTON_MASK (GAMEPAD_MASK_B1 | GAMEPAD_MASK_B2 | GAMEPAD_MASK_B3 | GAMEPAD_MASK_B4 | \
                             GAMEPAD_MASK_L1 | GAMEPAD_MASK_R1 | GAMEPAD_MASK_L2 | GAMEPAD_MASK_R2)
 
+// The turbo buttons that a pin presses, for the per-pin turbo
+inline uint16_t pinTurboButtons(const GpioMappingInfo &info) {
+    switch (info.action) {
+        case GpioAction::BUTTON_PRESS_B1: return GAMEPAD_MASK_B1;
+        case GpioAction::BUTTON_PRESS_B2: return GAMEPAD_MASK_B2;
+        case GpioAction::BUTTON_PRESS_B3: return GAMEPAD_MASK_B3;
+        case GpioAction::BUTTON_PRESS_B4: return GAMEPAD_MASK_B4;
+        case GpioAction::BUTTON_PRESS_L1: return GAMEPAD_MASK_L1;
+        case GpioAction::BUTTON_PRESS_R1: return GAMEPAD_MASK_R1;
+        case GpioAction::BUTTON_PRESS_L2: return GAMEPAD_MASK_L2;
+        case GpioAction::BUTTON_PRESS_R2: return GAMEPAD_MASK_R2;
+        case GpioAction::CUSTOM_BUTTON_COMBO: return info.customButtonMask & TURBO_BUTTON_MASK;
+        default: return 0;
+    }
+}
+
 // TURBO LED
 #ifndef TURBO_LED_PIN
 #define TURBO_LED_PIN -1
@@ -121,6 +137,12 @@ public:
     static TurboInput *active;  // The loaded add-on, for the control channel
 private:
     void updateTurboShotCount(uint8_t turboShotCount, bool save = true);
+    void loadPinTurbo();
+    bool turboTick();
+    // A pin with the turbo flag: its buttons repeat while no pin without the flag holds them
+    struct PinTurbo { Mask_t pin; Mask_t plainPins; uint16_t buttons; };
+    PinTurbo pinTurbo[NUM_BANK0_GPIOS];
+    uint8_t pinTurboCount = 0;
     Mask_t turboPinMask;        // Pin mask for Turbo pin
     bool bDebState;             // Debounce TURBO Button State
     uint32_t uDebTime;          // Debounce TURBO Button Time

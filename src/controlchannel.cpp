@@ -40,7 +40,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 15;
+constexpr uint8_t PROTO_MINOR = 16;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -51,6 +51,8 @@ constexpr uint16_t SLOT_HEAD_LEN = 20;
 constexpr uint16_t SLOT_PIN_LEN  = 10;
 constexpr uint16_t SLOT_LABEL    = 16;
 constexpr uint16_t SLOT_LEN      = SLOT_HEAD_LEN + SLOT_PIN_LEN * NUM_BANK0_GPIOS;
+// Bit 31 of a pin's d-pad mask in a slot is its turbo flag (v1.16): presses of the pin repeat at the turbo speed
+constexpr uint32_t SLOT_PIN_TURBO = 1u << 31;
 // READ_LIGHTS reply and WRITE_LIGHTS argument: a 4-byte head, then an AnimationProfile protobuf
 constexpr uint16_t LIGHTS_HEAD_LEN = 4;
 constexpr uint16_t LIGHTS_LEN      = LIGHTS_HEAD_LEN + AnimationProfile_size;
@@ -160,12 +162,13 @@ enum Capability : uint32_t {
     CAP_DIAG            = 1u << 20,
     CAP_PROFILE_KEYMAP  = 1u << 21,
     CAP_SHMUP_PINS      = 1u << 22,
+    CAP_PIN_TURBO       = 1u << 23,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
                                   CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS |
                                   CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS | CAP_DIAG |
-                                  CAP_PROFILE_KEYMAP | CAP_SHMUP_PINS;
+                                  CAP_PROFILE_KEYMAP | CAP_SHMUP_PINS | CAP_PIN_TURBO;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -583,6 +586,9 @@ bool buildSlot(uint16_t profile, uint16_t *len) {
         put32(p + 2, slot.pins[pin].customButtonMask);
         put32(p + 6, slot.pins[pin].customDpadMask);
     }
+    for (pb_size_t i = 0; defined && i < slot.turboPins_count; i++) {
+        if (slot.turboPins[i] < NUM_BANK0_GPIOS) buffer[SLOT_HEAD_LEN + slot.turboPins[i] * SLOT_PIN_LEN + 9] |= SLOT_PIN_TURBO >> 24;
+    }
     *len = SLOT_LEN;
     return true;
 }
@@ -792,8 +798,12 @@ uint8_t doWriteSlot(const uint8_t *arg, uint16_t argLen) {
     if (profile < 2 || profile > 6 || (flags & ~SLOT_FLAGS_ALL) ||
         arg[2] != NUM_BANK0_GPIOS || arg[3] != SLOT_PIN_LEN) return RES_BAD_ARG;
     for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
-        const int16_t action = (int16_t)get16(arg + SLOT_HEAD_LEN + pin * SLOT_PIN_LEN);
+        const uint8_t *p = arg + SLOT_HEAD_LEN + pin * SLOT_PIN_LEN;
+        const int16_t action = (int16_t)get16(p);
         if (action < _GpioAction_MIN || action > _GpioAction_MAX) return RES_BAD_ARG;
+        // Only a pin that presses a turbo button can have the turbo flag
+        const GpioMappingInfo info = { .action = (GpioAction)action, .customButtonMask = get32(p + 2) };
+        if ((get32(p + 6) & SLOT_PIN_TURBO) && pinTurboButtons(info) == 0) return RES_BAD_ARG;
     }
 
     Storage &storage = Storage::getInstance();
@@ -815,6 +825,7 @@ uint8_t doWriteSlot(const uint8_t *arg, uint16_t argLen) {
     // Like web-config: pins that profile 1 reserves or gives to an add-on keep its action
     GpioMappings &slot = profiles.gpioMappingsSets[profile - 2];
     const GpioMappingInfo *core = storage.getGpioMappings().pins;
+    slot.turboPins_count = 0;
     for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
         const uint8_t *p = arg + SLOT_HEAD_LEN + pin * SLOT_PIN_LEN;
         GpioMappingInfo &info = slot.pins[pin];
@@ -825,7 +836,8 @@ uint8_t doWriteSlot(const uint8_t *arg, uint16_t argLen) {
         } else {
             info.action = (GpioAction)(int16_t)get16(p);
             info.customButtonMask = get32(p + 2);
-            info.customDpadMask = get32(p + 6);
+            info.customDpadMask = get32(p + 6) & ~SLOT_PIN_TURBO;
+            if (get32(p + 6) & SLOT_PIN_TURBO) slot.turboPins[slot.turboPins_count++] = pin;
         }
     }
     slot.pins_count = NUM_BANK0_GPIOS;

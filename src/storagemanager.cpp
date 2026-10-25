@@ -157,6 +157,11 @@ void Storage::setFunctionalPinMappings()
 		}
 	}
 	setInvertedPins(profile ? *profile : config.gpioMappings);
+	const GpioMappings& active = profile ? *profile : config.gpioMappings;
+	turboPins = 0;
+	for (pb_size_t i = 0; i < active.turboPins_count; i++) {
+		if (active.turboPins[i] < NUM_BANK0_GPIOS) turboPins |= Mask_t{1} << active.turboPins[i];
+	}
 }
 
 /**

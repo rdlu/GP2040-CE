@@ -45,6 +45,7 @@ public:
 	AnimationOptions& getAnimationOptions() { return config.animationOptions; }
 	ProfileOptions& getProfileOptions() { return config.profileOptions; }
 	GpioMappingInfo* getProfilePinMappings() { return functionalPinMappings; }
+	Mask_t getProfileTurboPins() const { return turboPins; }
 	Mask_t getPressedGpios() const;
 	PeripheralOptions& getPeripheralOptions() { return config.peripheralOptions; }
 	BootModeOptions& getBootModeOptions() { return config.bootModeOptions; }
@@ -90,6 +91,7 @@ private:
 	GpioMappingInfo functionalPinMappings[NUM_BANK0_GPIOS];
 	KeyboardMapping* activeKeyboardMapping = &config.keyboardMapping;
 	Mask_t invertedPins = 0;
+	Mask_t turboPins = 0;
 	void setInvertedPins(const GpioMappings& mappings);
 	uint32_t systemFlashSize;
 	bool oneBoot = false;

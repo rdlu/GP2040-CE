@@ -33,8 +33,9 @@ bool TurboInput::available() {
             turboPinMask |= Mask_t{1} << pin;
         }
     }
-    // Also when turbo is off: the Turbo pin opens the menu, and turbo can be turned on without a reboot
-    return hasTurboAssigned;
+    // Always: the Turbo pin opens the menu, turbo can be turned on without a reboot,
+    // and a profile written later can have turbo pins
+    return true;
 }
 
 void TurboInput::setup(){
@@ -112,6 +113,32 @@ void TurboInput::setup(){
     nextTimer = getMicro();
     encoderValue = shotCount;
     updateTurboShotCount(shotCount, false);
+    loadPinTurbo();
+}
+
+void TurboInput::loadPinTurbo() {
+    const GpioMappingInfo *pinMappings = Storage::getInstance().getProfilePinMappings();
+    const Mask_t flagged = Storage::getInstance().getProfileTurboPins();
+    pinTurboCount = 0;
+    for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+        const uint16_t buttons = pinTurboButtons(pinMappings[pin]);
+        if (!(flagged & (Mask_t{1} << pin)) || buttons == 0) continue;
+        PinTurbo &entry = pinTurbo[pinTurboCount++];
+        entry = { Mask_t{1} << pin, 0, buttons };
+        for (Pin_t other = 0; other < (Pin_t)NUM_BANK0_GPIOS; other++) {
+            if (!(flagged & (Mask_t{1} << other)) && (pinTurboButtons(pinMappings[other]) & buttons)) entry.plainPins |= Mask_t{1} << other;
+        }
+    }
+}
+
+// Move the turbo timer; true in the half of the cycle where turbo buttons are released
+bool TurboInput::turboTick() {
+    uint64_t now = getMicro();
+    if (nextTimer < now) {
+        bTurboFlicker ^= true;
+        nextTimer = now + uIntervalUS - TURBO_LOOP_OFFSET;
+    }
+    return bTurboFlicker;
 }
 
 /**
@@ -127,6 +154,7 @@ void TurboInput::reinit()
             turboPinMask |= Mask_t{1} << pin;
         }
     }
+    loadPinTurbo();
 }
 
 void TurboInput::process()
@@ -155,11 +183,20 @@ void TurboInput::process()
     // The menu, the control channel or a hotkey can change these
     if (options.enabled != loadedEnabled || options.shmupModeEnabled != loadedShmup) setup();
 
-    if (!options.enabled) return;
-
     // Check if shotCount changed externally (e.g., via hotkey)
     if (options.shotCount != lastShotCount){
       updateTurboShotCount(options.shotCount, false);
+    }
+
+    // Turbo pins work also with turbo off: the flag is the opt-in
+    uint16_t pinRepeat = 0;
+    for (uint8_t i = 0; i < pinTurboCount; i++) {
+        if ((gamepad->debouncedGpio & pinTurbo[i].pin) && !(gamepad->debouncedGpio & pinTurbo[i].plainPins)) pinRepeat |= pinTurbo[i].buttons;
+    }
+
+    if (!options.enabled) {
+        if (pinTurboCount > 0 && turboTick()) gamepad->state.buttons &= ~pinRepeat;
+        return;
     }
 
     // Check for TURBO pin enabled
@@ -219,10 +256,7 @@ void TurboInput::process()
     }
 
     // Check if we've reached the next timer right before applying turbo state
-    if (nextTimer < now) {
-        bTurboFlicker ^= true;
-        nextTimer = now + uIntervalUS - TURBO_LOOP_OFFSET;
-    }
+    turboTick();
 
     // Set TURBO LED
     // OFF: No turbo buttons enabled
@@ -258,9 +292,9 @@ void TurboInput::process()
     // Disable button during turbo flicker
     if (bTurboFlicker) {
         if ( options.shmupModeEnabled && options.shmupMixMode == SHMUP_MIX_MODE_CHARGE_PRIORITY) {
-            gamepad->state.buttons &= ~(turboButtonsMask & ~(chargeState));  // Do not flicker charge buttons
+            gamepad->state.buttons &= ~((turboButtonsMask | pinRepeat) & ~(chargeState));  // Do not flicker charge buttons
         } else {
-            gamepad->state.buttons &= ~(turboButtonsMask);
+            gamepad->state.buttons &= ~(turboButtonsMask | pinRepeat);
         }
     }
 }
