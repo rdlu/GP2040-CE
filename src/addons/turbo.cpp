@@ -135,14 +135,15 @@ void TurboInput::process()
         const uint32_t now = getMillis();
         if (gamepad->state.buttons || gamepad->state.dpad) {
             menuHoldDone = true;
-        } else if (menuHoldStart == 0) {
-            menuHoldStart = now | 1;
+        } else if (!menuHold) {
+            menuHold = true;
+            menuHoldStart = now;
         } else if (!menuHoldDone && now - menuHoldStart >= TURBO_MENU_HOLD_MS) {
             menuHoldDone = true;
             EventManager::getInstance().triggerEvent(new GPMenuNavigateEvent(GpioAction::MENU_NAVIGATION_TOGGLE));
         }
     } else {
-        menuHoldStart = 0;
+        menuHold = false;
         menuHoldDone = false;
     }
 
