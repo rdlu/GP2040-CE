@@ -14,6 +14,9 @@
 #define DEFAULT_SHOT_PER_SEC 10
 #endif  // DEFAULT_SHOT_PER_SEC
 
+#define TURBO_SHOT_MIN 2
+#define TURBO_SHOT_MAX 30
+
 // TURBO Button Mask
 #define TURBO_BUTTON_MASK (GAMEPAD_MASK_B1 | GAMEPAD_MASK_B2 | GAMEPAD_MASK_B3 | GAMEPAD_MASK_B4 | \
                             GAMEPAD_MASK_L1 | GAMEPAD_MASK_R1 | GAMEPAD_MASK_L2 | GAMEPAD_MASK_R2)
@@ -110,6 +113,9 @@ public:
     virtual std::string name() { return TurboName; }
 
     void handleEncoder(GPEvent* e);
+    void setTurboButtons(uint16_t buttons);
+    uint16_t getTurboButtons() const { return turboButtonsMask; }
+    static TurboInput *active;  // The loaded add-on, for the control channel
 private:
     void updateTurboShotCount(uint8_t turboShotCount, bool save = true);
     Mask_t turboPinMask;        // Pin mask for Turbo pin

@@ -22,6 +22,7 @@
 #include "CRC32.h"
 #include "FlashPROM.h"
 #include "animationstation.h"
+#include "addons/turbo.h"
 #include "config.pb.h"
 #include "enums.pb.h"
 #include "drivermanager.h"
@@ -39,7 +40,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 11;
+constexpr uint8_t PROTO_MINOR = 12;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -82,6 +83,8 @@ constexpr uint8_t  HOTKEY_LEN       = 8;
 constexpr uint8_t  HOTKEYS          = 16;
 constexpr uint16_t HOTKEYS_LEN      = HOTKEYS_HEAD_LEN + HOTKEY_LEN * HOTKEYS;
 static_assert(HOTKEYS_LEN <= BUFFER_LEN - HEADER_LEN && _GamepadHotkey_MAX <= 0xff);
+// READ_INPUT_OPTIONS reply and WRITE_INPUT_OPTIONS argument: the d-pad and SOCD modes, then the turbo options
+constexpr uint16_t INPUT_OPTIONS_LEN = 28;
 
 constexpr uint16_t LOG_RECORDS     = 64;
 constexpr uint16_t LOG_DATA        = 24;
@@ -104,6 +107,7 @@ enum Command : uint8_t {
     CMD_READ_CUSTOM_COLORS = 0x0B,
     CMD_READ_KEYMAP    = 0x0C,
     CMD_READ_HOTKEYS   = 0x0D,
+    CMD_READ_INPUT_OPTIONS = 0x0E,
     CMD_SET_PROFILE    = 0x10,
     CMD_REBOOT         = 0x11,
     CMD_SET_INPUT_MODE = 0x12,
@@ -116,6 +120,7 @@ enum Command : uint8_t {
     CMD_WRITE_CUSTOM_COLORS = 0x1A,
     CMD_WRITE_KEYMAP   = 0x1B,
     CMD_WRITE_HOTKEYS  = 0x1C,
+    CMD_WRITE_INPUT_OPTIONS = 0x1D,
 };
 
 enum Result : uint8_t {
@@ -145,11 +150,12 @@ enum Capability : uint32_t {
     CAP_KEYMAP          = 1u << 16,
     CAP_HOTKEYS         = 1u << 17,
     CAP_ONE_BOOT_MODE   = 1u << 18,
+    CAP_INPUT_OPTIONS   = 1u << 19,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
                                   CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS |
-                                  CAP_ONE_BOOT_MODE;
+                                  CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -168,6 +174,18 @@ enum StatusFlag : uint8_t {
 };
 
 constexpr uint8_t INPUT_MODE_ONE_BOOT = 1u << 0;
+
+enum InputOptionsMask : uint8_t {
+    INPUT_OPTION_DPAD_MODE     = 1u << 0,
+    INPUT_OPTION_SOCD_MODE     = 1u << 1,
+    INPUT_OPTION_TURBO         = 1u << 2,
+    INPUT_OPTION_TURBO_SPEED   = 1u << 3,
+    INPUT_OPTION_TURBO_BUTTONS = 1u << 4,
+    INPUT_OPTION_SHMUP         = 1u << 5,
+    INPUT_OPTIONS_ALL          = 0x3f,
+};
+
+constexpr uint8_t INPUT_OPTIONS_TURBO_RUNS = 1u << 0;
 
 enum SlotFlag : uint8_t {
     SLOT_ENABLED = 1u << 0, // WRITE_SLOT enables the profile
@@ -323,6 +341,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_READ_CUSTOM_COLORS:
         case CMD_READ_KEYMAP:
         case CMD_READ_HOTKEYS:
+        case CMD_READ_INPUT_OPTIONS:
             return TUSB_DIR_IN;
         case CMD_SET_PROFILE:
         case CMD_REBOOT:
@@ -336,6 +355,7 @@ int commandDirection(uint8_t cmd) {
         case CMD_WRITE_CUSTOM_COLORS:
         case CMD_WRITE_KEYMAP:
         case CMD_WRITE_HOTKEYS:
+        case CMD_WRITE_INPUT_OPTIONS:
             return TUSB_DIR_OUT;
         default:
             return -1;
@@ -997,6 +1017,63 @@ uint8_t doWriteHotkeys(const uint8_t *arg, uint16_t argLen) {
     return RES_OK;
 }
 
+// The values in RAM; byte 10 and 11 give the modes that apply now: a held DP/LS/RS pin, and SOCD bypass where the mode can't take it
+uint16_t buildInputOptions() {
+    const GamepadOptions &options = Storage::getInstance().getGamepadOptions();
+    const TurboOptions &turbo = Storage::getInstance().getAddonOptions().turboOptions;
+    Gamepad *gamepad = Storage::getInstance().GetGamepad();
+    memset(buffer, 0, INPUT_OPTIONS_LEN);
+    buffer[0] = TurboInput::active != nullptr ? INPUT_OPTIONS_TURBO_RUNS : 0;
+    buffer[2] = (uint8_t)options.dpadMode;
+    buffer[3] = (uint8_t)options.socdMode;
+    buffer[4] = turbo.enabled ? 1 : 0;
+    buffer[5] = (uint8_t)turbo.shotCount;
+    put16(buffer + 6, TurboInput::active != nullptr ? TurboInput::active->getTurboButtons() : 0);
+    buffer[8] = turbo.shmupModeEnabled ? 1 : 0;
+    buffer[9] = (uint8_t)turbo.shmupMixMode;
+    buffer[10] = (uint8_t)(gamepad != nullptr ? gamepad->getActiveDpadMode() : options.dpadMode);
+    buffer[11] = (uint8_t)Gamepad::resolveSOCDMode(options);
+    const uint32_t shmup[8] = { turbo.shmupAlwaysOn1, turbo.shmupAlwaysOn2, turbo.shmupAlwaysOn3, turbo.shmupAlwaysOn4,
+                                turbo.shmupBtnMask1, turbo.shmupBtnMask2, turbo.shmupBtnMask3, turbo.shmupBtnMask4 };
+    for (int i = 0; i < 8; i++) put16(buffer + 12 + i * 2, (uint16_t)shmup[i]);
+    return INPUT_OPTIONS_LEN;
+}
+
+uint8_t doWriteInputOptions(const uint8_t *arg, uint16_t argLen) {
+    if (argLen < INPUT_OPTIONS_LEN) return RES_BAD_LENGTH;
+    const uint8_t mask = arg[0], flags = arg[1];
+    const uint16_t buttons = get16(arg + 6);
+    bool shmupValid = arg[8] <= 1 && arg[9] <= _ShmupMixMode_MAX;
+    for (int i = 0; i < 4; i++) shmupValid = shmupValid && !(get16(arg + 12 + i * 2) & ~TURBO_BUTTON_MASK);
+    if ((mask & ~INPUT_OPTIONS_ALL) || (flags & ~SLOT_PERSIST) || get16(arg + 10) != 0 ||
+        ((mask & INPUT_OPTION_DPAD_MODE) && arg[2] > _DpadMode_MAX) ||
+        ((mask & INPUT_OPTION_SOCD_MODE) && arg[3] > _SOCDMode_MAX) ||
+        ((mask & INPUT_OPTION_TURBO) && arg[4] > 1) ||
+        ((mask & INPUT_OPTION_TURBO_SPEED) && (arg[5] < TURBO_SHOT_MIN || arg[5] > TURBO_SHOT_MAX)) ||
+        ((mask & INPUT_OPTION_TURBO_BUTTONS) && (buttons & ~TURBO_BUTTON_MASK)) ||
+        ((mask & INPUT_OPTION_SHMUP) && !shmupValid)) return RES_BAD_ARG;
+
+    // Gamepad reads the modes for each report, and TurboInput sees a new shotCount, as after a hotkey
+    GamepadOptions &options = Storage::getInstance().getGamepadOptions();
+    TurboOptions &turbo = Storage::getInstance().getAddonOptions().turboOptions;
+    if (mask & INPUT_OPTION_DPAD_MODE) options.dpadMode = (DpadMode)arg[2];
+    if (mask & INPUT_OPTION_SOCD_MODE) options.socdMode = (SOCDMode)arg[3];
+    if (mask & INPUT_OPTION_TURBO) turbo.enabled = arg[4];
+    if (mask & INPUT_OPTION_TURBO_SPEED) turbo.shotCount = arg[5];
+    if (mask & INPUT_OPTION_SHMUP) {
+        uint32_t *shmup[8] = { &turbo.shmupAlwaysOn1, &turbo.shmupAlwaysOn2, &turbo.shmupAlwaysOn3, &turbo.shmupAlwaysOn4,
+                               &turbo.shmupBtnMask1, &turbo.shmupBtnMask2, &turbo.shmupBtnMask3, &turbo.shmupBtnMask4 };
+        for (int i = 0; i < 8; i++) *shmup[i] = get16(arg + 12 + i * 2);
+        turbo.shmupModeEnabled = arg[8];
+        turbo.shmupMixMode = (ShmupMixMode)arg[9];
+        // setup() reads the SHMUP options, and clears the turbo buttons to the always-on ones
+        if (TurboInput::active != nullptr) TurboInput::active->setup();
+    }
+    if ((mask & INPUT_OPTION_TURBO_BUTTONS) && TurboInput::active != nullptr) TurboInput::active->setTurboButtons(buttons);
+    if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
+    return RES_OK;
+}
+
 uint8_t doSetLights(const uint8_t *arg, uint16_t argLen) {
     if (argLen < 4) return RES_BAD_LENGTH;
     if (!lightsRunning) return RES_UNSUPPORTED;
@@ -1038,6 +1115,7 @@ uint8_t runCommand(uint8_t cmd, uint16_t len) {
         case CMD_WRITE_CUSTOM_COLORS: return doWriteCustomColors(arg, argLen);
         case CMD_WRITE_KEYMAP:   return doWriteKeymap(arg, argLen);
         case CMD_WRITE_HOTKEYS:  return doWriteHotkeys(arg, argLen);
+        case CMD_WRITE_INPUT_OPTIONS: return doWriteInputOptions(arg, argLen);
         default:                 return RES_UNSUPPORTED;
     }
 }
@@ -1075,6 +1153,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_READ_CUSTOM_COLORS: if (!buildCustomColors(&len)) return false; break;
             case CMD_READ_KEYMAP: len = buildKeymap(); break;
             case CMD_READ_HOTKEYS: len = buildHotkeys(); break;
+            case CMD_READ_INPUT_OPTIONS: len = buildInputOptions(); break;
             case CMD_READ_LOG: if (request->wLength < LOG_HEAD_LEN) return false; len = buildLog(request->wValue, request->wLength); break;
             default:
                 if (request->wLength < HEADER_LEN) {

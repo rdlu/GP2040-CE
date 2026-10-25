@@ -9,8 +9,6 @@
 #include <algorithm>
 #include <cmath>
 
-#define TURBO_SHOT_MIN 2
-#define TURBO_SHOT_MAX 30
 #define TURBO_DIAL_INCREMENTS (0xFFF / (TURBO_SHOT_MAX - TURBO_SHOT_MIN)) // 12-bit ADC
 #define TURBO_LOOP_OFFSET 50 // Extra time to compensate for loop runtime variance, turbo lags a bit otherwise
 
@@ -21,6 +19,8 @@
 #ifndef TURBO_LED_STATE_ON
 #define TURBO_LED_STATE_ON 1
 #endif
+
+TurboInput *TurboInput::active = nullptr;
 
 bool TurboInput::available() {
     // Turbo Button initialized by void Gamepad::setup()
@@ -38,6 +38,7 @@ bool TurboInput::available() {
 
 void TurboInput::setup(){
     const TurboOptions& options = Storage::getInstance().getAddonOptions().turboOptions;
+    active = this;
     uint32_t now = getMillis();
 
     // Turbo Dial
@@ -130,7 +131,7 @@ void TurboInput::process()
     uint16_t buttonsPressed = gamepad->state.buttons & TURBO_BUTTON_MASK;
     uint8_t dpadPressed = gamepad->state.dpad & GAMEPAD_MASK_DPAD;
 
-    if (!options.enabled && (!hasTurboAssigned == true)) return;
+    if (!options.enabled) return;
 
     // Check if shotCount changed externally (e.g., via hotkey)
     if (options.shotCount != lastShotCount){
@@ -236,6 +237,11 @@ void TurboInput::process()
             gamepad->state.buttons &= ~(turboButtonsMask);
         }
     }
+}
+
+void TurboInput::setTurboButtons(uint16_t buttons) {
+    turboButtonsMask = (buttons & TURBO_BUTTON_MASK) | alwaysEnabled;
+    Storage::getInstance().GetGamepad()->turboState.buttons = turboButtonsMask;
 }
 
 void TurboInput::updateTurboShotCount(uint8_t shotCount, bool save) {
