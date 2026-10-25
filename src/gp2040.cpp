@@ -39,6 +39,7 @@
 
 // Pico includes
 #include "pico/bootrom.h"
+#include "pico/platform.h"
 #include "pico/time.h"
 #include "hardware/adc.h"
 
@@ -106,7 +107,9 @@ void GP2040::setup() {
 	addons.LoadUSBAddon(new KeyboardHostAddon());
 	addons.LoadUSBAddon(new GamepadUSBHostAddon());
 	addons.LoadAddon(new AnalogInput());
-	addons.LoadAddon(new HETriggerAddon());
+	HETriggerAddon* heTrigger = new HETriggerAddon();
+	if (addons.LoadAddon(heTrigger))
+		heTriggerAddon = heTrigger;
 	addons.LoadAddon(new BootselButtonAddon());
 	addons.LoadAddon(new DualDirectionalInput());
 	addons.LoadAddon(new FocusModeAddon());
@@ -217,7 +220,7 @@ void GP2040::deinitializeStandardGpio() {
  * instead, if you don't want debounced data.
  */
 void GP2040::debounceGpioGetAll() {
-	Mask_t rawGpios = ~gpio_get_all64();
+	Mask_t rawGpios = Storage::getInstance().getPressedGpios();
 	Mask_t pressedGpios = rawGpios & buttonGpios;
 	Gamepad* gamepad = Storage::getInstance().GetGamepad();
 
@@ -254,7 +257,7 @@ void GP2040::debounceGpioGetAll() {
 	}
 }
 
-void GP2040::run() {
+void __not_in_flash_func(GP2040::run)() {
 	bool configMode = DriverManager::getInstance().isConfigMode();
 	GPDriver * inputDriver = DriverManager::getInstance().getDriver();
 	Gamepad * gamepad = Storage::getInstance().GetGamepad();
@@ -297,6 +300,10 @@ void GP2040::run() {
 
 		// Config Loop (Web-Config skips Core0 add-ons)
 		if (configMode == true) {
+			if (heTriggerAddon) {
+				heTriggerAddon->configModeProcess();
+				processedGamepad->state.heTriggers = gamepad->state.heTriggers;
+			}
 			inputDriver->process(gamepad);
 			rebootHotkeys.process(gamepad, configMode);
 			checkSaveRebootState();
@@ -483,7 +490,7 @@ GP2040::BootAction GP2040::getGpioMappedBootAction() {
 		default:
 			break;
 	}
-	Mask_t gpio = ~gpio_get_all64() & buttonGpios;
+	Mask_t gpio = Storage::getInstance().getPressedGpios() & buttonGpios;
 
 	if (gpio == bootModeOptions.usbModePinMask) {
 		action.type = BootActionType::ENTER_USB_MODE;
@@ -563,51 +570,51 @@ void GP2040::RebootHotkeys::process(Gamepad* gamepad, bool configMode) {
 
 void GP2040::checkRawState(const GamepadState& prevState, const GamepadState& currState) {
     // buttons pressed
-    if (
+    if ((
         ((currState.aux & ~prevState.aux) != 0) ||
         ((currState.dpad & ~prevState.dpad) != 0) ||
         ((currState.buttons & ~prevState.buttons) != 0)
-    ) {
+    ) && EventManager::getInstance().hasEventHandlers(GP_EVENT_BUTTON_DOWN)) {
         EventManager::getInstance().triggerEvent(new GPButtonDownEvent((currState.dpad & ~prevState.dpad), (currState.buttons & ~prevState.buttons), (currState.aux & ~prevState.aux)));
     }
 
     // buttons released
-    if (
+    if ((
         ((prevState.aux & ~currState.aux) != 0) ||
         ((prevState.dpad & ~currState.dpad) != 0) ||
         ((prevState.buttons & ~currState.buttons) != 0)
-    ) {
+    ) && EventManager::getInstance().hasEventHandlers(GP_EVENT_BUTTON_UP)) {
         EventManager::getInstance().triggerEvent(new GPButtonUpEvent((prevState.dpad & ~currState.dpad), (prevState.buttons & ~currState.buttons), (prevState.aux & ~currState.aux)));
     }
 }
 
 void GP2040::checkProcessedState(const GamepadState& prevState, const GamepadState& currState) {
     // buttons pressed
-    if (
+    if ((
         ((currState.aux & ~prevState.aux) != 0) ||
         ((currState.dpad & ~prevState.dpad) != 0) ||
         ((currState.buttons & ~prevState.buttons) != 0)
-    ) {
+    ) && EventManager::getInstance().hasEventHandlers(GP_EVENT_BUTTON_PROCESSED_DOWN)) {
         EventManager::getInstance().triggerEvent(new GPButtonProcessedDownEvent((currState.dpad & ~prevState.dpad), (currState.buttons & ~prevState.buttons), (currState.aux & ~prevState.aux)));
     }
 
     // buttons released
-    if (
+    if ((
         ((prevState.aux & ~currState.aux) != 0) ||
         ((prevState.dpad & ~currState.dpad) != 0) ||
         ((prevState.buttons & ~currState.buttons) != 0)
-    ) {
+    ) && EventManager::getInstance().hasEventHandlers(GP_EVENT_BUTTON_PROCESSED_UP)) {
         EventManager::getInstance().triggerEvent(new GPButtonProcessedUpEvent((prevState.dpad & ~currState.dpad), (prevState.buttons & ~currState.buttons), (prevState.aux & ~currState.aux)));
     }
 
-    if (
+    if ((
         (currState.lx != prevState.lx) ||
         (currState.ly != prevState.ly) ||
         (currState.rx != prevState.rx) ||
         (currState.ry != prevState.ry) ||
         (currState.lt != prevState.lt) ||
         (currState.rt != prevState.rt)
-    ) {
+    ) && EventManager::getInstance().hasEventHandlers(GP_EVENT_ANALOG_PROCESSED_MOVE)) {
         EventManager::getInstance().triggerEvent(new GPAnalogProcessedMoveEvent(currState.lx, currState.ly, currState.rx, currState.ry, currState.lt, currState.rt));
     }
 }

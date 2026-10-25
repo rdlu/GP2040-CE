@@ -33,8 +33,10 @@ typedef enum {
     CMD_VIBRATION    = 0x0A,
     CMD_BATTERY      = 0x0B,
     CMD_FEATURE      = 0x0C,
+    CMD_FW_UPDATE    = 0x0D,
     CMD_FW_INFO      = 0x10,
     CMD_UNKNOWN11    = 0x11,
+    CMD_UNKNOWN13    = 0x13,
     CMD_PAIRING      = 0x15,
     CMD_UNKNOWN16    = 0x16,
     CMD_UNKNOWN18    = 0x18,
@@ -44,7 +46,7 @@ static uint8_t cmdRequest[CMD_BUFFER_LEN];
 static uint8_t cmdReply[CMD_REPLY_MAX];
 static uint16_t cmdReplyLen;
 static bool cmdReplyPending;
-static bool reportsEnabled;
+static bool reportsEnabled = true;
 static uint8_t playerLedMask;
 static uint8_t btLongTermKey[16];
 static uint8_t hostAddress[6];
@@ -67,7 +69,7 @@ static uint16_t stringDescriptor[64];
 static void resetProtocolState() {
     cmdReplyLen = 0;
     cmdReplyPending = false;
-    reportsEnabled = false;
+    reportsEnabled = true;
     playerLedMask = 0;
 }
 
@@ -306,6 +308,14 @@ static void handleCommand(const uint8_t *req) {
                 setReply(command, sub, nullptr, 0);
             }
             break;
+        case CMD_UNKNOWN13:
+            if (sub == 0x01) {
+                const uint8_t payload[] = { 0x01, 0x00, 0x00, 0x00 };
+                setReply(command, sub, payload, sizeof(payload));
+            } else {
+                setReply(command, sub, nullptr, 0);
+            }
+            break;
         case CMD_PAIRING:
             replyPairing(req);
             break;
@@ -396,8 +406,10 @@ static bool switch2pro_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_contr
 static bool switch2pro_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
     switch (ep_addr) {
         case SWITCH2_PRO_EP_BULK_OUT:
+            // Ignore firmware updates so the console fails cleanly instead of hanging
             if (result == XFER_RESULT_SUCCESS && xferred_bytes >= 4 &&
-                    cmdRequest[1] == CMD_DIRECTION_REQUEST && cmdRequest[2] == CMD_TRANSPORT_USB) {
+                    cmdRequest[1] == CMD_DIRECTION_REQUEST && cmdRequest[2] == CMD_TRANSPORT_USB &&
+                    cmdRequest[0] != CMD_FW_UPDATE) {
                 if (xferred_bytes < sizeof(cmdRequest))
                     memset(&cmdRequest[xferred_bytes], 0, sizeof(cmdRequest) - xferred_bytes);
                 handleCommand(cmdRequest);
@@ -545,9 +557,29 @@ bool Switch2ProDriver::process(Gamepad * gamepad) {
     processedGamepad->auxState.playerID.active = reportsEnabled;
     processedGamepad->auxState.playerID.ledValue = playerLedMask;
     processedGamepad->auxState.playerID.value = playerLedMask;
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
 
-    if (tud_suspended())
-        tud_remote_wakeup();
+    static bool previousWakeInput = false;
+    static bool lastWakeupValid = false;
+    static uint32_t lastWakeupMs = 0;
+
+    const bool currentWakeInput =
+        gamepad->state.buttons != 0 ||
+        gamepad->state.dpad != 0 ||
+        (gamepad->hasAnalogTriggers &&
+         (gamepad->state.lt >= 128 || gamepad->state.rt >= 128));
+    const bool wakeEdge = currentWakeInput && !previousWakeInput;
+    previousWakeInput = currentWakeInput;
+
+    if (tud_suspended()) {
+        if (wakeEdge &&
+            (!lastWakeupValid || (uint32_t)(now - lastWakeupMs) >= 2000) &&
+            tud_remote_wakeup()) {
+            lastWakeupMs = now;
+            lastWakeupValid = true;
+        }
+        return false;
+    }
 
     if (!reportsEnabled)
         return false;
@@ -557,8 +589,9 @@ bool Switch2ProDriver::process(Gamepad * gamepad) {
     if (gamepad->pressedB2()) b0 |= SWITCH2_PRO_MASK_A;
     if (gamepad->pressedB3()) b0 |= SWITCH2_PRO_MASK_Y;
     if (gamepad->pressedB4()) b0 |= SWITCH2_PRO_MASK_X;
-    if (gamepad->pressedR1()) b0 |= SWITCH2_PRO_MASK_R;
-    if (gamepad->pressedR2()) b0 |= SWITCH2_PRO_MASK_ZR;
+    const bool gamecube = firmwareType == SWITCH2_FW_TYPE_GAMECUBE;
+    if (gamepad->pressedR1()) b0 |= gamecube ? SWITCH2_GAMECUBE_MASK_Z : SWITCH2_PRO_MASK_R;
+    if (gamepad->pressedR2()) b0 |= gamecube ? SWITCH2_GAMECUBE_MASK_R : SWITCH2_PRO_MASK_ZR;
     if (gamepad->pressedS2()) b0 |= SWITCH2_PRO_MASK_PLUS;
     if (gamepad->pressedR3()) b0 |= SWITCH2_PRO_MASK_RSTICK;
 
@@ -566,8 +599,8 @@ bool Switch2ProDriver::process(Gamepad * gamepad) {
     if (gamepad->pressedRight()) b1 |= SWITCH2_PRO_MASK_RIGHT;
     if (gamepad->pressedLeft())  b1 |= SWITCH2_PRO_MASK_LEFT;
     if (gamepad->pressedUp())    b1 |= SWITCH2_PRO_MASK_UP;
-    if (gamepad->pressedL1())    b1 |= SWITCH2_PRO_MASK_L;
-    if (gamepad->pressedL2())    b1 |= SWITCH2_PRO_MASK_ZL;
+    if (gamepad->pressedL1())    b1 |= gamecube ? SWITCH2_GAMECUBE_MASK_ZL : SWITCH2_PRO_MASK_L;
+    if (gamepad->pressedL2())    b1 |= gamecube ? SWITCH2_GAMECUBE_MASK_L : SWITCH2_PRO_MASK_ZL;
     if (gamepad->pressedS1())    b1 |= SWITCH2_PRO_MASK_MINUS;
     if (gamepad->pressedL3())    b1 |= SWITCH2_PRO_MASK_LSTICK;
 
@@ -583,6 +616,10 @@ bool Switch2ProDriver::process(Gamepad * gamepad) {
     packStick(&inputReport[5], gamepad->state.lx, gamepad->state.ly);
     packStick(&inputReport[8], gamepad->state.rx, gamepad->state.ry);
     inputReport[11] = 0x38;
+    if (gamecube) {
+        inputReport[12] = gamepad->pressedL2() ? 0xFF : (gamepad->hasAnalogTriggers ? gamepad->state.lt : 0x00);
+        inputReport[13] = gamepad->pressedR2() ? 0xFF : (gamepad->hasAnalogTriggers ? gamepad->state.rt : 0x00);
+    }
     if (joyCon2Side != 0) {
         const bool left = joyCon2Side == 1;
         uint16_t x = gamepad->state.lx;
@@ -624,7 +661,6 @@ bool Switch2ProDriver::process(Gamepad * gamepad) {
         else
             packStick(&inputReport[5], y, GAMEPAD_JOYSTICK_MAX - x);
     }
-    const uint32_t now = to_ms_since_boot(get_absolute_time());
     const bool changed = memcmp(&inputReport[2], &lastSentState[0], sizeof(lastSentState)) != 0;
     if (!changed && (now - lastSentMs) < SWITCH2_PRO_KEEPALIVE_MS)
         return false;
@@ -633,7 +669,8 @@ bool Switch2ProDriver::process(Gamepad * gamepad) {
 
     inputReport[0] = reportCounter;
     const uint8_t reportId = joyCon2Side == 1 ? SWITCH2_JOYCON2_LEFT_INPUT_REPORT_ID
-        : joyCon2Side == 2 ? SWITCH2_JOYCON2_RIGHT_INPUT_REPORT_ID : SWITCH2_PRO_INPUT_REPORT_ID;
+        : joyCon2Side == 2 ? SWITCH2_JOYCON2_RIGHT_INPUT_REPORT_ID
+        : firmwareType == SWITCH2_FW_TYPE_GAMECUBE ? SWITCH2_GAMECUBE_INPUT_REPORT_ID : SWITCH2_PRO_INPUT_REPORT_ID;
     if (!tud_hid_n_report(0, reportId, inputReport, sizeof(inputReport)))
         return false;
     memcpy(lastSentState, &inputReport[2], sizeof(lastSentState));
@@ -706,6 +743,8 @@ const uint8_t * Switch2ProDriver::get_hid_descriptor_report_cb(uint8_t itf) {
         return switch2_joycon2_left_report_descriptor;
     if (joyCon2Side == 2)
         return switch2_joycon2_right_report_descriptor;
+    if (firmwareType == SWITCH2_FW_TYPE_GAMECUBE)
+        return switch2gamecube_report_descriptor;
     return switch2pro_report_descriptor;
 }
 
