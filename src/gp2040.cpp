@@ -45,6 +45,8 @@
 
 #include "rndis.h"
 
+void webConfigHeapSetup(); // webconfig.cpp
+
 // TinyUSB
 #include "tusb.h"
 
@@ -272,6 +274,7 @@ void __not_in_flash_func(GP2040::run)() {
 	USBHostManager::getInstance().start();
 
 	if (configMode == true ) {
+		webConfigHeapSetup();
 		rndis_init(WEB_CONFIG_HOSTNAME);
 	}
 #ifdef GP2040_CONTROL_CHANNEL

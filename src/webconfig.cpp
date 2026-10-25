@@ -1,3 +1,5 @@
+#include <malloc.h>
+#include <unistd.h>
 #include "config.pb.h"
 #include "base64.h"
 #include "hardware/adc.h"
@@ -253,6 +255,23 @@ static size_t freeHeap()
     const uint32_t total = System::getTotalHeap();
     const uint32_t used = System::getUsedHeap();
     return (total > used) ? (total - used) : 0;
+}
+
+// newlib's malloc gets a block that is larger than its top chunk with sbrk() of the full size,
+// rounded up to a page: free memory inside the heap does not count.
+static const size_t SBRK_PAGE = 4096;
+
+static size_t largestNewBlock()
+{
+    extern char __StackLimit;
+    const size_t room = &__StackLimit - static_cast<char*>(sbrk(0));
+    return (room > SBRK_PAGE * 2) ? (room - SBRK_PAGE * 2) : 0;
+}
+
+void webConfigHeapSetup()
+{
+    // Give freed memory at the top of the heap back to sbrk(), so later large replies can get it
+    mallopt(M_TRIM_THRESHOLD, SBRK_PAGE);
 }
 
 static void deleteReply(std::string* reply)
@@ -3223,7 +3242,7 @@ DataAndStatusCode getConfigReply()
     const size_t avail = freeHeap();
     if (liveLargeReplies == 0 && avail > MIN_FREE_HEAP_AFTER_REPLY) {
         std::string data = ConfigUtils::toJSON(Storage::getInstance().getConfig(), HTTP_HEADER_RESERVE,
-                                               avail - MIN_FREE_HEAP_AFTER_REPLY);
+                                               std::min(avail - MIN_FREE_HEAP_AFTER_REPLY, largestNewBlock()));
         if (!data.empty()) return DataAndStatusCode(std::move(data), HttpStatusCode::_200);
     }
     return busyReply();
