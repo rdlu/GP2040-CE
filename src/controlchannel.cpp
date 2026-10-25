@@ -40,7 +40,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 14;
+constexpr uint8_t PROTO_MINOR = 15;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -85,7 +85,10 @@ constexpr uint8_t  HOTKEYS          = 16;
 constexpr uint16_t HOTKEYS_LEN      = HOTKEYS_HEAD_LEN + HOTKEY_LEN * HOTKEYS;
 static_assert(HOTKEYS_LEN <= BUFFER_LEN - HEADER_LEN && _GamepadHotkey_MAX <= 0xff);
 // READ_INPUT_OPTIONS reply and WRITE_INPUT_OPTIONS argument: the d-pad and SOCD modes, then the turbo options
-constexpr uint16_t INPUT_OPTIONS_LEN = 28;
+// Bytes 28 to 31 (v1.15) are the SHMUP charge pins; a write without them is 28 bytes
+constexpr uint16_t INPUT_OPTIONS_LEN = 32;
+constexpr uint16_t INPUT_OPTIONS_V12_LEN = 28;
+constexpr uint8_t  SHMUP_NO_PIN = 0xFF;
 
 constexpr uint16_t LOG_RECORDS     = 64;
 constexpr uint16_t LOG_DATA        = 24;
@@ -156,12 +159,13 @@ enum Capability : uint32_t {
     CAP_INPUT_OPTIONS   = 1u << 19,
     CAP_DIAG            = 1u << 20,
     CAP_PROFILE_KEYMAP  = 1u << 21,
+    CAP_SHMUP_PINS      = 1u << 22,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
                                   CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS |
                                   CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS | CAP_DIAG |
-                                  CAP_PROFILE_KEYMAP;
+                                  CAP_PROFILE_KEYMAP | CAP_SHMUP_PINS;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -188,7 +192,8 @@ enum InputOptionsMask : uint8_t {
     INPUT_OPTION_TURBO_SPEED   = 1u << 3,
     INPUT_OPTION_TURBO_BUTTONS = 1u << 4,
     INPUT_OPTION_SHMUP         = 1u << 5,
-    INPUT_OPTIONS_ALL          = 0x3f,
+    INPUT_OPTION_SHMUP_PINS    = 1u << 6,
+    INPUT_OPTIONS_ALL          = 0x7f,
 };
 
 constexpr uint8_t INPUT_OPTIONS_TURBO_RUNS = 1u << 0;
@@ -1084,12 +1089,22 @@ uint16_t buildInputOptions() {
     const uint32_t shmup[8] = { turbo.shmupAlwaysOn1, turbo.shmupAlwaysOn2, turbo.shmupAlwaysOn3, turbo.shmupAlwaysOn4,
                                 turbo.shmupBtnMask1, turbo.shmupBtnMask2, turbo.shmupBtnMask3, turbo.shmupBtnMask4 };
     for (int i = 0; i < 8; i++) put16(buffer + 12 + i * 2, (uint16_t)shmup[i]);
+    const int32_t pins[4] = { turbo.shmupBtn1Pin, turbo.shmupBtn2Pin, turbo.shmupBtn3Pin, turbo.shmupBtn4Pin };
+    for (int i = 0; i < 4; i++) buffer[28 + i] = isValidPin(pins[i]) ? (uint8_t)pins[i] : SHMUP_NO_PIN;
     return INPUT_OPTIONS_LEN;
 }
 
 uint8_t doWriteInputOptions(const uint8_t *arg, uint16_t argLen) {
-    if (argLen < INPUT_OPTIONS_LEN) return RES_BAD_LENGTH;
+    if (argLen < INPUT_OPTIONS_V12_LEN) return RES_BAD_LENGTH;
     const uint8_t mask = arg[0], flags = arg[1];
+    if ((mask & INPUT_OPTION_SHMUP_PINS) && argLen < INPUT_OPTIONS_LEN) return RES_BAD_LENGTH;
+    // A charge pin must not belong to other hardware (a display, LEDs); it can be a pin with no button
+    const GpioMappingInfo *core = Storage::getInstance().getGpioMappings().pins;
+    bool pinsValid = true;
+    for (int i = 0; (mask & INPUT_OPTION_SHMUP_PINS) && i < 4; i++) {
+        const uint8_t pin = arg[28 + i];
+        pinsValid = pinsValid && (pin == SHMUP_NO_PIN || (pin < NUM_BANK0_GPIOS && !fixedAction(core[pin].action)));
+    }
     const uint16_t buttons = get16(arg + 6);
     bool shmupValid = arg[8] <= 1 && arg[9] <= _ShmupMixMode_MAX;
     for (int i = 0; i < 4; i++) shmupValid = shmupValid && !(get16(arg + 12 + i * 2) & ~TURBO_BUTTON_MASK);
@@ -1099,7 +1114,7 @@ uint8_t doWriteInputOptions(const uint8_t *arg, uint16_t argLen) {
         ((mask & INPUT_OPTION_TURBO) && arg[4] > 1) ||
         ((mask & INPUT_OPTION_TURBO_SPEED) && (arg[5] < TURBO_SHOT_MIN || arg[5] > TURBO_SHOT_MAX)) ||
         ((mask & INPUT_OPTION_TURBO_BUTTONS) && (buttons & ~TURBO_BUTTON_MASK)) ||
-        ((mask & INPUT_OPTION_SHMUP) && !shmupValid)) return RES_BAD_ARG;
+        ((mask & INPUT_OPTION_SHMUP) && !shmupValid) || !pinsValid) return RES_BAD_ARG;
 
     // Gamepad reads the modes for each report, and TurboInput sees a new shotCount, as after a hotkey
     GamepadOptions &options = Storage::getInstance().getGamepadOptions();
@@ -1108,15 +1123,19 @@ uint8_t doWriteInputOptions(const uint8_t *arg, uint16_t argLen) {
     if (mask & INPUT_OPTION_SOCD_MODE) options.socdMode = (SOCDMode)arg[3];
     if (mask & INPUT_OPTION_TURBO) turbo.enabled = arg[4];
     if (mask & INPUT_OPTION_TURBO_SPEED) turbo.shotCount = arg[5];
+    if (mask & INPUT_OPTION_SHMUP_PINS) {
+        int32_t *pins[4] = { &turbo.shmupBtn1Pin, &turbo.shmupBtn2Pin, &turbo.shmupBtn3Pin, &turbo.shmupBtn4Pin };
+        for (int i = 0; i < 4; i++) *pins[i] = arg[28 + i] == SHMUP_NO_PIN ? -1 : arg[28 + i];
+    }
     if (mask & INPUT_OPTION_SHMUP) {
         uint32_t *shmup[8] = { &turbo.shmupAlwaysOn1, &turbo.shmupAlwaysOn2, &turbo.shmupAlwaysOn3, &turbo.shmupAlwaysOn4,
                                &turbo.shmupBtnMask1, &turbo.shmupBtnMask2, &turbo.shmupBtnMask3, &turbo.shmupBtnMask4 };
         for (int i = 0; i < 8; i++) *shmup[i] = get16(arg + 12 + i * 2);
         turbo.shmupModeEnabled = arg[8];
         turbo.shmupMixMode = (ShmupMixMode)arg[9];
-        // setup() reads the SHMUP options, and clears the turbo buttons to the always-on ones
-        if (TurboInput::active != nullptr) TurboInput::active->setup();
     }
+    // setup() reads the SHMUP options and pins, and clears the turbo buttons to the always-on ones
+    if ((mask & (INPUT_OPTION_SHMUP | INPUT_OPTION_SHMUP_PINS)) && TurboInput::active != nullptr) TurboInput::active->setup();
     if ((mask & INPUT_OPTION_TURBO_BUTTONS) && TurboInput::active != nullptr) TurboInput::active->setTurboButtons(buttons);
     if (flags & SLOT_PERSIST) EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
     return RES_OK;
