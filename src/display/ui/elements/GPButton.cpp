@@ -109,6 +109,8 @@ void GPButton::draw() {
             case GpioAction::BUTTON_PRESS_R3: turboState |= (getGamepad()->turboState.buttons & GAMEPAD_MASK_R3); break;
             default: break;
         }
+        // A turbo pin of the profile
+        if (Storage::getInstance().getProfileTurboPins() & (Mask_t{1} << this->_inputMask)) turboState = true;
     } else if (_inputType == GP_ELEMENT_HE_BUTTON) {
         pinState = ((getProcessedGamepad()->state.heTriggers >> this->_inputMask) & 0x01);
         buttonState = true;
