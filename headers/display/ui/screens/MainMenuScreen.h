@@ -77,9 +77,6 @@ class MainMenuScreen : public GPScreen {
         void selectTurboSpeed();
         int32_t currentTurboSpeed();
 
-        void selectShmupMode();
-        int32_t currentShmupMode();
-
         void updateMenuNavigation(GpioAction action);
         void updateEventMenuNavigation(GpioAction action);
         void chooseAndReturn();
@@ -179,17 +176,9 @@ class MainMenuScreen : public GPScreen {
         uint32_t prevTurboSpeed = 0;
         uint32_t updateTurboSpeed = 0;
 
-        std::vector<MenuEntry> shmupModeMenu = [this] { return std::vector<MenuEntry>{
-            {"Off",        NULL, nullptr,        std::bind(&MainMenuScreen::currentShmupMode, this), std::bind(&MainMenuScreen::selectShmupMode, this), 0},
-            {"On",         NULL, nullptr,        std::bind(&MainMenuScreen::currentShmupMode, this), std::bind(&MainMenuScreen::selectShmupMode, this), 1},
-        }; }();
-        bool prevShmup = false;
-        bool updateShmup = false;
-
         std::vector<MenuEntry> turboMenu = [this] { return std::vector<MenuEntry>{
             {"Turbo",      NULL, &turboModeMenu,  [this] { return modeValue(); }, [this] { testMenu(); }},
             {"Speed",      NULL, &turboSpeedMenu, [this] { return modeValue(); }, [this] { testMenu(); }},
-            {"SHMUP Mode", NULL, &shmupModeMenu,  [this] { return modeValue(); }, [this] { testMenu(); }},
         }; }();
 
         std::vector<MenuEntry> saveMenu = [this] { return std::vector<MenuEntry>{

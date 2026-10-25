@@ -108,9 +108,6 @@ void MainMenuScreen::init() {
     prevTurboSpeed = Storage::getInstance().getAddonOptions().turboOptions.shotCount;
     updateTurboSpeed = prevTurboSpeed;
 
-    prevShmup = Storage::getInstance().getAddonOptions().turboOptions.shmupModeEnabled;
-    updateShmup = prevShmup;
-
     setMenuHome();
 }
 
@@ -383,7 +380,6 @@ void MainMenuScreen::resetOptions() {
         if (prevFocus != updateFocus) updateFocus = prevFocus;
         if (prevTurbo != updateTurbo) updateTurbo = prevTurbo;
         if (prevTurboSpeed != updateTurboSpeed) updateTurboSpeed = prevTurboSpeed;
-        if (prevShmup != updateShmup) updateShmup = prevShmup;
     }
 
     changeRequiresSave = false;
@@ -423,10 +419,6 @@ void MainMenuScreen::saveOptions() {
         }
         if (prevTurboSpeed != updateTurboSpeed) {
             addonOptions.turboOptions.shotCount = updateTurboSpeed;
-            saveHasChanged = true;
-        }
-        if (prevShmup != updateShmup) {
-            addonOptions.turboOptions.shmupModeEnabled = updateShmup;
             saveHasChanged = true;
         }
 
@@ -507,20 +499,4 @@ void MainMenuScreen::selectTurboSpeed() {
 
 int32_t MainMenuScreen::currentTurboSpeed() {
     return updateTurboSpeed;
-}
-
-void MainMenuScreen::selectShmupMode() {
-    if (currentMenu->at(gpMenu->getIndex()).optionValue != -1) {
-        bool valueToSave = (bool)currentMenu->at(gpMenu->getIndex()).optionValue;
-        prevShmup = Storage::getInstance().getAddonOptions().turboOptions.shmupModeEnabled;
-        updateShmup = valueToSave;
-
-        chooseAndReturn();
-
-        if (prevShmup != valueToSave) changeRequiresSave = true;
-    }
-}
-
-int32_t MainMenuScreen::currentShmupMode() {
-    return updateShmup;
 }
