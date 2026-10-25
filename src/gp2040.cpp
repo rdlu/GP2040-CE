@@ -12,6 +12,9 @@
 #include "addonmanager.h"
 #include "types.h"
 #include "usbhostmanager.h"
+#ifdef GP2040_CONTROL_CHANNEL
+#include "controlchannel.h"
+#endif
 
 // Inputs for Core0
 #include "addons/analog.h"
@@ -144,6 +147,15 @@ void GP2040::setup() {
 	}
 
 	InputMode inputMode = bootAction.inputMode;
+#ifdef GP2040_CONTROL_CHANNEL
+	// A held boot button picks its mode as before
+	InputMode oneBootMode;
+	if (ControlChannel::takeOneBootMode(oneBootMode) && bootAction.type == BootActionType::SET_INPUT_MODE &&
+		inputMode == gamepadOptions.inputMode && oneBootMode != inputMode) {
+		Storage::getInstance().setOneBootInputMode(oneBootMode);
+		inputMode = oneBootMode;
+	}
+#endif
 
 	// Setup USB Driver
 	DriverManager::getInstance().setup(inputMode);
@@ -154,7 +166,7 @@ void GP2040::setup() {
 
 		// save to match user expectations on choosing mode at boot, and this is
 		// before USB host will be used so we can force it to ignore the check
-		if (inputModeChanged || profileChanged) Storage::getInstance().save(true);
+		if ((inputModeChanged && !Storage::getInstance().isOneBootInputMode()) || profileChanged) Storage::getInstance().save(true);
 	}
 
 	// register system event handlers

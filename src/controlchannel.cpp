@@ -39,7 +39,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 10;
+constexpr uint8_t PROTO_MINOR = 11;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -64,6 +64,9 @@ constexpr uint16_t CONFIG_HEAD_LEN   = 12;
 constexpr uint16_t CONFIG_CHUNK_HEAD = 4;
 
 constexpr uint16_t INPUT_LEN       = 36;
+// SET_INPUT_MODE with ONE_BOOT keeps the mode here for the next boot; a power-on clears it
+constexpr uint8_t  ONE_BOOT_SCRATCH = 6;
+constexpr uint32_t ONE_BOOT_MAGIC   = 0x4f420000;
 constexpr uint32_t SCAN_TIMEOUT_MS = 10000;
 
 constexpr uint16_t COLORS_HEAD_LEN = 4;
@@ -141,10 +144,12 @@ enum Capability : uint32_t {
     CAP_CUSTOM_COLORS   = 1u << 15,
     CAP_KEYMAP          = 1u << 16,
     CAP_HOTKEYS         = 1u << 17,
+    CAP_ONE_BOOT_MODE   = 1u << 18,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
-                                  CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS;
+                                  CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS |
+                                  CAP_ONE_BOOT_MODE;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -159,7 +164,10 @@ constexpr uint32_t BOOTABLE_MODES =
 enum StatusFlag : uint8_t {
     FLAG_PROFILE_PENDING = 1u << 0,
     FLAG_REBOOT_PENDING  = 1u << 1,
+    FLAG_ONE_BOOT_MODE   = 1u << 2,
 };
+
+constexpr uint8_t INPUT_MODE_ONE_BOOT = 1u << 0;
 
 enum SlotFlag : uint8_t {
     SLOT_ENABLED = 1u << 0, // WRITE_SLOT enables the profile
@@ -422,6 +430,7 @@ uint16_t buildStatus() {
     Gamepad *gamepad = storage.GetGamepad();
     if (gamepad != nullptr && gamepad->lastReinitProfileNumber != profileNumber) flags |= FLAG_PROFILE_PENDING;
     if (rebootPending) flags |= FLAG_REBOOT_PENDING;
+    if (storage.isOneBootInputMode()) flags |= FLAG_ONE_BOOT_MODE;
 
     memset(buffer, 0, 16);
     buffer[0] = PROTO_MAJOR;
@@ -433,6 +442,7 @@ uint16_t buildStatus() {
     put16(buffer + 6, lastSeq);
     buffer[8] = lastCmd;
     buffer[9] = lastResult;
+    buffer[10] = (uint8_t)storage.getSavedInputMode();
     put32(buffer + 12, to_ms_since_boot(get_absolute_time()));
     return 16;
 }
@@ -719,9 +729,14 @@ uint8_t doSetInputMode(const uint8_t *arg, uint16_t argLen) {
     const uint8_t mode = arg[0];
     if (mode >= 32 || !(BOOTABLE_MODES & (1u << mode))) return RES_UNSUPPORTED;
     if (forcedLock(false)) return RES_LOCKED;
-    Storage::getInstance().getGamepadOptions().inputMode = (InputMode)mode;
+    if (arg[1] & INPUT_MODE_ONE_BOOT) {
+        watchdog_hw->scratch[ONE_BOOT_SCRATCH] = ONE_BOOT_MAGIC | mode;
+    } else {
+        Storage::getInstance().clearOneBootInputMode();
+        Storage::getInstance().getGamepadOptions().inputMode = (InputMode)mode;
+        EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
+    }
     // GAMEPAD boot mode skips the boot button scan, so a held button can't override the new mode
-    EventManager::getInstance().triggerEvent(new GPStorageSaveEvent(true));
     EventManager::getInstance().triggerEvent(new GPRestartEvent(System::BootMode::GAMEPAD));
     rebootPending = true;
     return RES_OK;
@@ -1076,6 +1091,16 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
         return lastResult == RES_OK;
     }
 
+    return true;
+}
+
+bool ControlChannel::takeOneBootMode(InputMode &mode) {
+    const uint32_t value = watchdog_hw->scratch[ONE_BOOT_SCRATCH];
+    watchdog_hw->scratch[ONE_BOOT_SCRATCH] = 0;
+    const uint32_t m = value & 0xffff;
+    if (!watchdog_caused_reboot() || (value & 0xffff0000) != ONE_BOOT_MAGIC || m >= 32 || !(BOOTABLE_MODES & (1u << m)))
+        return false;
+    mode = (InputMode)m;
     return true;
 }
 

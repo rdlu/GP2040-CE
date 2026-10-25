@@ -2321,11 +2321,15 @@ bool ConfigUtils::save(Config& config)
     const int32_t activeProfileIndex = config.animationOptions.baseProfileIndex;
     if (animStation.IsTestModeActive())
         config.animationOptions.baseProfileIndex = animStation.GetSavedMode();
+    // A one-boot input mode stays out of flash
+    const InputMode activeInputMode = config.gamepadOptions.inputMode;
+    config.gamepadOptions.inputMode = Storage::getInstance().getSavedInputMode();
 
     // Encode the data directly into the cache of FlashPROM
     pb_ostream_t outputStream = pb_ostream_from_buffer(EEPROM.writeCache, EEPROM_SIZE_BYTES - sizeof(ConfigFooter));
     const bool encoded = pb_encode(&outputStream, Config_fields, &config);
     config.animationOptions.baseProfileIndex = activeProfileIndex;
+    config.gamepadOptions.inputMode = activeInputMode;
     if (!encoded)
     {
         return false;

@@ -51,6 +51,16 @@ public:
 	bool save();
 	bool save(const bool force);
 
+	// A one-boot input mode runs: a save keeps the saved mode
+	void setOneBootInputMode(InputMode mode) {
+		savedInputMode = config.gamepadOptions.inputMode;
+		oneBootInputMode = mode;
+		oneBoot = true;
+	}
+	void clearOneBootInputMode() { oneBoot = false; }
+	bool isOneBootInputMode() const { return oneBoot && config.gamepadOptions.inputMode == oneBootInputMode; }
+	InputMode getSavedInputMode() const { return isOneBootInputMode() ? savedInputMode : config.gamepadOptions.inputMode; }
+
 	void SetGamepad(Gamepad *); 		// MPGS Gamepad Get/Set
 	Gamepad * GetGamepad();
 
@@ -77,6 +87,9 @@ private:
 	Config config;
 	GpioMappingInfo functionalPinMappings[NUM_BANK0_GPIOS];
 	uint32_t systemFlashSize;
+	bool oneBoot = false;
+	InputMode oneBootInputMode;
+	InputMode savedInputMode;
 };
 
 #endif

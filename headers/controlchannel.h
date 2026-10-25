@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include "tusb.h"
+#include "enums.pb.h"
 
 class AnimationStation;
 
@@ -17,6 +18,9 @@ namespace ControlChannel {
     // Called on core1 by NeoPicoLEDAddon, which owns AnimationStation
     void lightsSetup();
     void lightsProcess(AnimationStation &as);
+
+    // Called once at boot: the mode of a one-boot SET_INPUT_MODE, if one was sent
+    bool takeOneBootMode(InputMode &mode);
 }
 
 #endif
