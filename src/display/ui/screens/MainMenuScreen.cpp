@@ -67,6 +67,22 @@ void MainMenuScreen::init() {
         }
     }
 
+    // Gamepad input uses the profile 1 pins, so the menu buttons stay the same in every profile
+    if (Storage::getInstance().getGamepadOptions().miniMenuGamepadInput) {
+        GpioMappingInfo* basePinMappings = Storage::getInstance().getGpioMappings().pins;
+        for (Pin_t pin = 0; pin < (Pin_t)NUM_BANK0_GPIOS; pin++) {
+            switch (basePinMappings[pin].action) {
+                case GpioAction::BUTTON_PRESS_UP: mapMenuUp->pinMask |= Mask_t{1} << pin; break;
+                case GpioAction::BUTTON_PRESS_DOWN: mapMenuDown->pinMask |= Mask_t{1} << pin; break;
+                case GpioAction::BUTTON_PRESS_LEFT: mapMenuLeft->pinMask |= Mask_t{1} << pin; break;
+                case GpioAction::BUTTON_PRESS_RIGHT: mapMenuRight->pinMask |= Mask_t{1} << pin; break;
+                case GpioAction::BUTTON_PRESS_B1: mapMenuSelect->pinMask |= Mask_t{1} << pin; break;
+                case GpioAction::BUTTON_PRESS_B2: mapMenuBack->pinMask |= Mask_t{1} << pin; break;
+                default:    break;
+            }
+        }
+    }
+
     changeRequiresReboot = false;
     changeRequiresSave = false;
     prevInputMode = Storage::getInstance().GetGamepad()->getOptions().inputMode;
@@ -142,10 +158,7 @@ void MainMenuScreen::setMenuHome() {
 
 int8_t MainMenuScreen::update() {
     if (isMenuReady) {
-        GamepadOptions & gamepadOptions = Storage::getInstance().getGamepadOptions();
         Mask_t values = Storage::getInstance().GetGamepad()->debouncedGpio;
-        uint16_t buttonState = getGamepad()->state.buttons;
-        uint8_t dpadState = getGamepad()->state.dpad;
 
         if (prevValues != values) {
             if (values & mapMenuUp->pinMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_UP);
@@ -160,21 +173,6 @@ int8_t MainMenuScreen::update() {
                 exitToScreenBeforePrompt = DisplayMode::BUTTONS;
             }
         }
-        if (gamepadOptions.miniMenuGamepadInput == true ) {
-            if (prevDpadState != dpadState ) {
-                if (dpadState == mapMenuUp->buttonMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_UP);
-                else if (dpadState == mapMenuDown->buttonMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_DOWN);
-                else if (dpadState == mapMenuLeft->buttonMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_LEFT);
-                else if (dpadState == mapMenuRight->buttonMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_RIGHT);
-            }
-            if ( prevButtonState != buttonState ) {
-                if (buttonState == mapMenuSelect->buttonMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_SELECT);
-                else if (buttonState == mapMenuBack->buttonMask) updateMenuNavigation(GpioAction::MENU_NAVIGATION_BACK);
-            }
-        }
-
-        prevButtonState = buttonState;
-        prevDpadState = dpadState;
         prevValues = values;
 
         // Core0 Event Navigations
