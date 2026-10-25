@@ -129,6 +129,8 @@ private:
     uint16_t lastPressed;       // Last buttons pressed (for Turbo Enable)
     uint8_t lastDpad;           // Last d-pad pressed (for Turbo Change)
     bool menuHold = false;      // The Turbo pin is held
+    bool loadedEnabled = false; // turboOptions.enabled at the last setup()
+    bool loadedShmup = false;   // turboOptions.shmupModeEnabled at the last setup()
     uint32_t menuHoldStart = 0; // When the Turbo pin was pressed
     bool menuHoldDone = false;  // The menu was toggled, or another input was used, in this hold
     uint16_t turboButtonsMask;  // Turbo Buttons Enabled

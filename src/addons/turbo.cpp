@@ -33,7 +33,8 @@ bool TurboInput::available() {
             turboPinMask |= Mask_t{1} << pin;
         }
     }
-    return Storage::getInstance().getAddonOptions().turboOptions.enabled && (hasTurboAssigned == true);
+    // Also when turbo is off: the Turbo pin opens the menu, and turbo can be turned on without a reboot
+    return hasTurboAssigned;
 }
 
 void TurboInput::setup(){
@@ -63,8 +64,11 @@ void TurboInput::setup(){
     }
 
     Gamepad * gamepad = Storage::getInstance().GetProcessedGamepad();
-	  gamepad->auxState.turbo.enabled = true;
+	  gamepad->auxState.turbo.enabled = options.enabled;
     gamepad->auxState.turbo.active = 1;
+    gamepad->auxState.turbo.activity = TURBO_LED_STATE_OFF;
+    loadedEnabled = options.enabled;
+    loadedShmup = options.shmupModeEnabled;
 
     // SHMUP Mode
     if ( options.shmupModeEnabled ) {
@@ -146,6 +150,9 @@ void TurboInput::process()
         menuHold = false;
         menuHoldDone = false;
     }
+
+    // The menu, the control channel or a hotkey can change these
+    if (options.enabled != loadedEnabled || options.shmupModeEnabled != loadedShmup) setup();
 
     if (!options.enabled) return;
 
