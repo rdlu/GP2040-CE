@@ -7,7 +7,7 @@ extern uint32_t getMillis();
 void MainMenuScreen::init() {
     getRenderer()->clearScreen();
     currentMenu = &mainMenu;
-    previousMenu = nullptr;
+    menuStack.clear();
 
     exitToScreen = -1;
 
@@ -105,6 +105,12 @@ void MainMenuScreen::init() {
     prevTurbo = Storage::getInstance().getAddonOptions().turboOptions.enabled;
     updateTurbo = Storage::getInstance().getAddonOptions().turboOptions.enabled;
 
+    prevTurboSpeed = Storage::getInstance().getAddonOptions().turboOptions.shotCount;
+    updateTurboSpeed = prevTurboSpeed;
+
+    prevShmup = Storage::getInstance().getAddonOptions().turboOptions.shmupModeEnabled;
+    updateShmup = prevShmup;
+
     setMenuHome();
 }
 
@@ -151,7 +157,7 @@ void MainMenuScreen::setMenu(std::vector<MenuEntry>* menu) {
 
 void MainMenuScreen::setMenuHome() {
     currentMenu = &mainMenu;
-    previousMenu = nullptr;
+    menuStack.clear();
 
     exitToScreen = -1;
     prevValues = Storage::getInstance().GetGamepad()->debouncedGpio;
@@ -264,26 +270,18 @@ void MainMenuScreen::updateMenuNavigation(GpioAction action) {
                     break;
                 case GpioAction::MENU_NAVIGATION_SELECT:
                     if (currentMenu->at(menuIndex).submenu != nullptr) {
-                        previousMenu = currentMenu;
+                        menuStack.push_back({currentMenu, gpMenu->getMenuTitle(), menuIndex});
+                        const std::string title = currentMenu->at(menuIndex).label;
                         currentMenu = currentMenu->at(menuIndex).submenu;
                         gpMenu->setMenuData(currentMenu);
-                        gpMenu->setMenuTitle(previousMenu->at(menuIndex).label);
+                        gpMenu->setMenuTitle(title);
                         gpMenu->setIndex(0);
                     } else {
                         currentMenu->at(menuIndex).action();
                     }
                     break;
                 case GpioAction::MENU_NAVIGATION_BACK:
-                    if (previousMenu != nullptr) {
-                        currentMenu = previousMenu;
-                        previousMenu = nullptr;
-                        gpMenu->setMenuData(currentMenu);
-                        gpMenu->setMenuTitle(MAIN_MENU_NAME);
-                        gpMenu->setIndex(0);
-                    } else {
-                        exitToScreen = DisplayMode::BUTTONS;
-                        exitToScreenBeforePrompt = DisplayMode::BUTTONS;
-                    }
+                    menuBack();
                     break;
                 default:
                     break;
@@ -292,18 +290,23 @@ void MainMenuScreen::updateMenuNavigation(GpioAction action) {
     }
 }
 
-void MainMenuScreen::chooseAndReturn() {
-    if (previousMenu != nullptr) {
-        currentMenu = previousMenu;
-        previousMenu = nullptr;
+void MainMenuScreen::menuBack() {
+    if (!menuStack.empty()) {
+        const MenuLevel level = menuStack.back();
+        menuStack.pop_back();
+        currentMenu = level.menu;
         gpMenu->setMenuData(currentMenu);
-        gpMenu->setMenuTitle(MAIN_MENU_NAME);
-        gpMenu->setIndex(0);
+        gpMenu->setMenuTitle(level.title);
+        gpMenu->setIndex(level.index);
     } else {
         exitToScreen = DisplayMode::BUTTONS;
         exitToScreenBeforePrompt = DisplayMode::BUTTONS;
-        isPressed = false;
     }
+}
+
+void MainMenuScreen::chooseAndReturn() {
+    menuBack();
+    isPressed = false;
 }
 
 void MainMenuScreen::saveAndExit() {
@@ -379,6 +382,8 @@ void MainMenuScreen::resetOptions() {
         if (prevProfile != updateProfile) updateProfile = prevProfile;
         if (prevFocus != updateFocus) updateFocus = prevFocus;
         if (prevTurbo != updateTurbo) updateTurbo = prevTurbo;
+        if (prevTurboSpeed != updateTurboSpeed) updateTurboSpeed = prevTurboSpeed;
+        if (prevShmup != updateShmup) updateShmup = prevShmup;
     }
 
     changeRequiresSave = false;
@@ -414,6 +419,14 @@ void MainMenuScreen::saveOptions() {
         }
         if ((bool)prevTurbo != (bool)updateTurbo) {
             addonOptions.turboOptions.enabled = (bool)updateTurbo;
+            saveHasChanged = true;
+        }
+        if (prevTurboSpeed != updateTurboSpeed) {
+            addonOptions.turboOptions.shotCount = updateTurboSpeed;
+            saveHasChanged = true;
+        }
+        if (prevShmup != updateShmup) {
+            addonOptions.turboOptions.shmupModeEnabled = updateShmup;
             saveHasChanged = true;
         }
 
@@ -478,4 +491,36 @@ void MainMenuScreen::selectTurboMode() {
 
 int32_t MainMenuScreen::currentTurboMode() {
     return updateTurbo;
+}
+
+void MainMenuScreen::selectTurboSpeed() {
+    if (currentMenu->at(gpMenu->getIndex()).optionValue != -1) {
+        uint32_t valueToSave = currentMenu->at(gpMenu->getIndex()).optionValue;
+        prevTurboSpeed = Storage::getInstance().getAddonOptions().turboOptions.shotCount;
+        updateTurboSpeed = valueToSave;
+
+        chooseAndReturn();
+
+        if (prevTurboSpeed != valueToSave) changeRequiresSave = true;
+    }
+}
+
+int32_t MainMenuScreen::currentTurboSpeed() {
+    return updateTurboSpeed;
+}
+
+void MainMenuScreen::selectShmupMode() {
+    if (currentMenu->at(gpMenu->getIndex()).optionValue != -1) {
+        bool valueToSave = (bool)currentMenu->at(gpMenu->getIndex()).optionValue;
+        prevShmup = Storage::getInstance().getAddonOptions().turboOptions.shmupModeEnabled;
+        updateShmup = valueToSave;
+
+        chooseAndReturn();
+
+        if (prevShmup != valueToSave) changeRequiresSave = true;
+    }
+}
+
+int32_t MainMenuScreen::currentShmupMode() {
+    return updateShmup;
 }

@@ -6,6 +6,7 @@
 #include "enums.pb.h"
 #include "animationstation.h"
 #include "eventmanager.h"
+#include "addons/turbo.h"
 
 #define INPUT_MODE_XINPUT_NAME "XInput"
 #define INPUT_MODE_SWITCH_NAME "Nintendo Switch"
@@ -73,6 +74,12 @@ class MainMenuScreen : public GPScreen {
         void selectTurboMode();
         int32_t currentTurboMode();
 
+        void selectTurboSpeed();
+        int32_t currentTurboSpeed();
+
+        void selectShmupMode();
+        int32_t currentShmupMode();
+
         void updateMenuNavigation(GpioAction action);
         void updateEventMenuNavigation(GpioAction action);
         void chooseAndReturn();
@@ -84,7 +91,10 @@ class MainMenuScreen : public GPScreen {
         bool isPressed = false;
         uint32_t checkDebounce = 0;
         std::vector<MenuEntry>* currentMenu = nullptr;
-        std::vector<MenuEntry>* previousMenu = nullptr;
+        // The menus above the current one, with their titles and selected entries
+        struct MenuLevel { std::vector<MenuEntry>* menu; std::string title; uint16_t index; };
+        std::vector<MenuLevel> menuStack;
+        void menuBack();
         uint16_t prevButtonState = 0;
         uint8_t prevDpadState = 0;
         Mask_t prevValues = 0;
@@ -160,6 +170,28 @@ class MainMenuScreen : public GPScreen {
         bool prevTurbo = false;
         bool updateTurbo = false;
 
+        std::vector<MenuEntry> turboSpeedMenu = [this] {
+            std::vector<MenuEntry> menu;
+            for (int32_t shots = TURBO_SHOT_MIN; shots <= TURBO_SHOT_MAX; shots++)
+                menu.push_back({std::to_string(shots) + " shots/s", NULL, nullptr, std::bind(&MainMenuScreen::currentTurboSpeed, this), std::bind(&MainMenuScreen::selectTurboSpeed, this), shots});
+            return menu;
+        }();
+        uint32_t prevTurboSpeed = 0;
+        uint32_t updateTurboSpeed = 0;
+
+        std::vector<MenuEntry> shmupModeMenu = [this] { return std::vector<MenuEntry>{
+            {"Off",        NULL, nullptr,        std::bind(&MainMenuScreen::currentShmupMode, this), std::bind(&MainMenuScreen::selectShmupMode, this), 0},
+            {"On",         NULL, nullptr,        std::bind(&MainMenuScreen::currentShmupMode, this), std::bind(&MainMenuScreen::selectShmupMode, this), 1},
+        }; }();
+        bool prevShmup = false;
+        bool updateShmup = false;
+
+        std::vector<MenuEntry> turboMenu = [this] { return std::vector<MenuEntry>{
+            {"Turbo",      NULL, &turboModeMenu,  [this] { return modeValue(); }, [this] { testMenu(); }},
+            {"Speed",      NULL, &turboSpeedMenu, [this] { return modeValue(); }, [this] { testMenu(); }},
+            {"SHMUP Mode", NULL, &shmupModeMenu,  [this] { return modeValue(); }, [this] { testMenu(); }},
+        }; }();
+
         std::vector<MenuEntry> saveMenu = [this] { return std::vector<MenuEntry>{
             {"Save & Exit",NULL, nullptr,        std::bind(&MainMenuScreen::modeValue, this), std::bind(&MainMenuScreen::saveAndExit, this), 1},
             {"Exit",       NULL, nullptr,        std::bind(&MainMenuScreen::modeValue, this), std::bind(&MainMenuScreen::exitOnly, this), 0},
@@ -171,7 +203,7 @@ class MainMenuScreen : public GPScreen {
             {"SOCD Mode",  NULL, &socdModeMenu,  [this] { return modeValue(); }, [this] { testMenu(); }},
             {"Profile",    NULL, &profilesMenu,  [this] { return modeValue(); }, [this] { testMenu(); }},
             /*{"Focus Mode", NULL, &focusModeMenu, [this] { return modeValue(); }, [this] { testMenu(); }},*/
-            {"Turbo",      NULL, &turboModeMenu, [this] { return modeValue(); }, [this] { testMenu(); }},
+            {"Turbo",      NULL, &turboMenu,     [this] { return modeValue(); }, [this] { testMenu(); }},
             {"Exit",       NULL, &saveMenu,      [this] { return modeValue(); }, [this] { testMenu(); }},
         }; }();
 
