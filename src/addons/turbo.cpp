@@ -131,9 +131,11 @@ void TurboInput::process()
     uint16_t buttonsPressed = gamepad->state.buttons & TURBO_BUTTON_MASK;
     uint8_t dpadPressed = gamepad->state.dpad & GAMEPAD_MASK_DPAD;
 
-    if ((gamepad->debouncedGpio & turboPinMask) && !gamepad->state.buttons && !gamepad->state.dpad) {
+    if (gamepad->debouncedGpio & turboPinMask) {
         const uint32_t now = getMillis();
-        if (menuHoldStart == 0) {
+        if (gamepad->state.buttons || gamepad->state.dpad) {
+            menuHoldDone = true;
+        } else if (menuHoldStart == 0) {
             menuHoldStart = now | 1;
         } else if (!menuHoldDone && now - menuHoldStart >= TURBO_MENU_HOLD_MS) {
             menuHoldDone = true;
