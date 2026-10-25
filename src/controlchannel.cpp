@@ -40,7 +40,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 12;
+constexpr uint8_t PROTO_MINOR = 13;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -92,6 +92,8 @@ constexpr uint16_t LOG_HEAD_LEN    = 12;
 constexpr uint32_t LOG_MAGIC       = 0x474c4f47;
 constexpr uint32_t LOG_EARLY_MS    = 10000;
 constexpr uint8_t  LOG_EARLY_MAX   = 3;
+constexpr uint32_t STEPS_MAGIC     = 0x53544550;
+constexpr uint32_t WATCHDOG_MS     = 3000;
 static_assert(sizeof(GpioMappings::profileLabel) > SLOT_LABEL);
 
 enum Command : uint8_t {
@@ -151,11 +153,12 @@ enum Capability : uint32_t {
     CAP_HOTKEYS         = 1u << 17,
     CAP_ONE_BOOT_MODE   = 1u << 18,
     CAP_INPUT_OPTIONS   = 1u << 19,
+    CAP_DIAG            = 1u << 20,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
                                   CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS |
-                                  CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS;
+                                  CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS | CAP_DIAG;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -221,6 +224,8 @@ enum LogCode : uint8_t {
     LOG_RESTART  = 0x06,
     LOG_ERROR    = 0x07,
     LOG_USB_HOST = 0x08,
+    LOG_WATCHDOG = 0x09,
+    LOG_FAULT    = 0x0A,
 };
 
 struct LogRecord {
@@ -245,6 +250,14 @@ struct LogRing {
 };
 
 constexpr uint32_t LOG_LAYOUT = (LOG_RECORDS << 16) | sizeof(LogRecord);
+
+// The last step of core 0, core 1 and the flash write (in an alarm on core 0), and when each one began
+struct Steps {
+    uint32_t magic;
+    volatile uint16_t step[3];
+    volatile uint32_t ms[3];
+    volatile uint32_t core1Loop;
+};
 
 // tud_control_xfer() keeps this pointer until the transfer completes
 uint8_t buffer[BUFFER_LEN];
@@ -278,6 +291,7 @@ bool scanActive = false;
 absolute_time_t scanDeadline;
 
 LogRing __uninitialized_ram(logRing);
+Steps __uninitialized_ram(steps);
 critical_section_t logLock;
 
 inline void put16(uint8_t *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
@@ -463,6 +477,8 @@ uint16_t buildStatus() {
     buffer[8] = lastCmd;
     buffer[9] = lastResult;
     buffer[10] = (uint8_t)storage.getSavedInputMode();
+    const uint32_t core1Age = steps.core1Loop ? (to_ms_since_boot(get_absolute_time()) - steps.core1Loop) / 10 : UINT32_MAX;
+    buffer[11] = (uint8_t)std::min<uint32_t>(core1Age, 255);
     put32(buffer + 12, to_ms_since_boot(get_absolute_time()));
     return 16;
 }
@@ -1173,6 +1189,24 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
     return true;
 }
 
+void ControlChannel::step(uint16_t step) {
+    const uint core = get_core_num();
+    const uint32_t ms = to_ms_since_boot(get_absolute_time());
+    steps.step[core] = step;
+    steps.ms[core] = ms;
+    if (step == STEP_LOOP) {
+        if (core == 0) watchdog_update();
+        else steps.core1Loop = ms;
+    }
+}
+
+void ControlChannel::watchdogStart() { watchdog_enable(WATCHDOG_MS, true); }
+
+extern "C" void flashWriteStep(uint8_t step) {
+    steps.step[2] = step;
+    steps.ms[2] = to_ms_since_boot(get_absolute_time());
+}
+
 bool ControlChannel::takeOneBootMode(InputMode &mode) {
     const uint32_t value = watchdog_hw->scratch[ONE_BOOT_SCRATCH];
     watchdog_hw->scratch[ONE_BOOT_SCRATCH] = 0;
@@ -1261,11 +1295,23 @@ __attribute__((constructor)) static void logSetup() {
         logRing.boot++;
     }
 
-    uint8_t data[LOG_DATA] = { (uint8_t)((kept ? 1 : 0) | (watchdog_caused_reboot() ? 2 : 0)),
+    const bool timeout = watchdog_enable_caused_reboot();
+    uint8_t data[LOG_DATA] = { (uint8_t)((kept ? 1 : 0) | (watchdog_caused_reboot() ? 2 : 0) | (timeout ? 4 : 0)),
                                bootModeIndex(watchdog_hw->scratch[5]) };
     const uint8_t versionLen = strnlen(GP2040VERSION, LOG_DATA - 2);
     memcpy(data + 2, GP2040VERSION, versionLen);
     logAddUnlocked(LOG_BOOT, data, 2 + versionLen);
+    if (kept && timeout && steps.magic == STEPS_MAGIC) {
+        uint8_t d[22];
+        for (int i = 0; i < 3; i++) {
+            put16(d + i * 2, steps.step[i]);
+            put32(d + 6 + i * 4, steps.ms[i]);
+        }
+        put32(d + 18, steps.core1Loop);
+        logAddUnlocked(LOG_WATCHDOG, d, sizeof(d));
+    }
+    memset(&steps, 0, sizeof(steps));
+    steps.magic = STEPS_MAGIC;
 
     EventManager &events = EventManager::getInstance();
     events.registerEventHandler(GP_EVENT_PROFILE_CHANGE, [](GPEvent *e) {
@@ -1297,6 +1343,38 @@ __attribute__((constructor)) static void logSetup() {
             logAdd(LOG_USB_HOST, d, sizeof(d));
         });
     }
+}
+
+// The HardFault handler: keep the core, its last step, PC, LR and xPSR, then reboot as after a panic
+extern "C" void __attribute__((used, noreturn)) gamepadiiFault(const uint32_t *frame) {
+    const uint8_t core = get_core_num();
+    uint8_t d[18] = { core, 0 };
+    put16(d + 2, steps.step[core]);
+    put32(d + 4, frame[6]);
+    put32(d + 8, frame[5]);
+    put32(d + 12, frame[7]);
+    put16(d + 16, steps.step[core ^ 1]);
+    logAddUnlocked(LOG_FAULT, d, sizeof(d));
+    if (to_ms_since_boot(get_absolute_time()) < LOG_EARLY_MS) logRing.earlyPanics++;
+    else logRing.earlyPanics = 0;
+    logRing.check = logCheck();
+    if (logRing.earlyPanics >= LOG_EARLY_MAX) for (;;) __wfi();
+    watchdog_reboot(0, 0, 0);
+    for (;;) __wfi();
+}
+
+extern "C" void __attribute__((naked)) isr_hardfault() {
+    asm volatile(
+        "movs r0, #4\n"
+        "mov r1, lr\n"
+        "tst r0, r1\n"
+        "beq 1f\n"
+        "mrs r0, psp\n"
+        "b 2f\n"
+        "1: mrs r0, msp\n"
+        "2: ldr r1, =gamepadiiFault\n"
+        "bx r1\n"
+        ".ltorg\n");
 }
 
 // PICO_PANIC_FUNCTION: keep the message, then reboot. A pad that panics again and again soon after boot halts as before.

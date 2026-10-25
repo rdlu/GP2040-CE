@@ -5,6 +5,7 @@
 #include "drivermanager.h"
 #include "storagemanager.h"
 #include "usbhostmanager.h"
+#include "controlchannel.h"
 
 #include "addons/board_led.h"  // Add-Ons
 #include "addons/buzzerspeaker.h"
@@ -52,12 +53,14 @@ void GP2040Aux::setup() {
 
 void GP2040Aux::run() {
 	while (1) {
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_LOOP);
 		// Pre, Process, and Post
 		addons.PreprocessAddons();
 		addons.ProcessAddons();
 
 		// Run auxiliary functions for input driver on Core1
 		if ( inputDriver != nullptr ) {
+			CONTROL_CHANNEL_STEP(ControlChannel::STEP_AUX_DRIVER);
 			inputDriver->processAux();
 		}
 	}

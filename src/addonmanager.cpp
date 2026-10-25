@@ -1,5 +1,6 @@
 #include "addonmanager.h"
 #include "usbhostmanager.h"
+#include "controlchannel.h"
 
 bool AddonManager::LoadAddon(GPAddon* addon) {
     if (addon->available()) {
@@ -32,6 +33,7 @@ void AddonManager::ReinitializeAddons() {
 void AddonManager::PreprocessAddons() {
     // Loop through all addons and process any that match our type
     for (std::vector<AddonBlock*>::iterator it = addons.begin(); it != addons.end(); it++) {
+        CONTROL_CHANNEL_STEP(ControlChannel::STEP_PREPROCESS_ADDON + (it - addons.begin()));
         (*it)->ptr->preprocess();
     }
 }
@@ -39,6 +41,7 @@ void AddonManager::PreprocessAddons() {
 void AddonManager::ProcessAddons() {
     // Loop through all addons and process any that match our type
     for (std::vector<AddonBlock*>::iterator it = addons.begin(); it != addons.end(); it++) {
+        CONTROL_CHANNEL_STEP(ControlChannel::STEP_PROCESS_ADDON + (it - addons.begin()));
         (*it)->ptr->process();
     }
 }

@@ -12,9 +12,7 @@
 #include "addonmanager.h"
 #include "types.h"
 #include "usbhostmanager.h"
-#ifdef GP2040_CONTROL_CHANNEL
 #include "controlchannel.h"
-#endif
 
 // Inputs for Core0
 #include "addons/analog.h"
@@ -273,13 +271,21 @@ void GP2040::run() {
 	if (configMode == true ) {
 		rndis_init(WEB_CONFIG_HOSTNAME);
 	}
+#ifdef GP2040_CONTROL_CHANNEL
+	else {
+		ControlChannel::watchdogStart();
+	}
+#endif
 
 	while (1) { // LOOP
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_LOOP);
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_REINIT);
 		this->getReinitGamepad(gamepad);
 
 		memcpy(&prevState, &gamepad->state, sizeof(GamepadState));
 
 		// Debounce
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_READ);
 		debounceGpioGetAll();
 		// Read Gamepad
 		gamepad->read();
@@ -300,11 +306,13 @@ void GP2040::run() {
 		// Pre-Process add-ons for MPGS
 		addons.PreprocessAddons();
 
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_PROCESS);
 		gamepad->process(); // process through MPGS
 
 		// (Post) Process for add-ons
 		addons.ProcessAddons();
 
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_HOTKEY);
 		gamepad->hotkey(); 	// check for MPGS hotkeys
 		rebootHotkeys.process(gamepad, configMode);
 
@@ -314,9 +322,11 @@ void GP2040::run() {
 		memcpy(&processedGamepad->state, &gamepad->state, sizeof(GamepadState));
 
 		// Process Input Driver
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_DRIVER);
 		bool processed = inputDriver->process(gamepad);
 
 		// TinyUSB Task update
+		CONTROL_CHANNEL_STEP(ControlChannel::STEP_USB);
 		tud_task();
 
 		// Post-Process Add-ons with USB Report Processed Sent
@@ -603,6 +613,7 @@ void GP2040::checkProcessedState(const GamepadState& prevState, const GamepadSta
 }
 
 void GP2040::checkSaveRebootState() {
+	CONTROL_CHANNEL_STEP(ControlChannel::STEP_SAVE_REBOOT);
 	if (saveRequested) {
 		saveRequested = false;
 		Storage::getInstance().save(forceSave);

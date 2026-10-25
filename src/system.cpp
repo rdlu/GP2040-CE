@@ -1,6 +1,7 @@
 #include "system.h"
 
 #include "usbhostmanager.h"
+#include "controlchannel.h"
 
 #include <hardware/flash.h>
 #include <hardware/sync.h>
@@ -69,6 +70,7 @@ void System::reboot(BootMode bootMode) {
 
     // Make sure that the other core is halted
     // We do not want it to be talking to devices (e.g. OLED display) while we reboot
+	CONTROL_CHANNEL_STEP(ControlChannel::STEP_REBOOT_LOCKOUT);
 	multicore_lockout_start_timeout_us(0xfffffffffffffff);
 
     // wait 50ms to prevent web config crashing

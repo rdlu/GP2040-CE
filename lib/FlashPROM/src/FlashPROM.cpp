@@ -9,12 +9,17 @@ uint8_t FlashPROM::writeCache[EEPROM_SIZE_BYTES];
 volatile static alarm_id_t flashWriteAlarm = 0;
 volatile static spin_lock_t *flashLock = nullptr;
 
+// A firmware can follow the write: 1 lockout, 2 erase and program, 3 done
+extern "C" void __attribute__((weak)) flashWriteStep(uint8_t step) {}
+
 int64_t writeToFlash(alarm_id_t id, void *flashCache)
 {
 	while (is_spin_locked(flashLock));
 
+	flashWriteStep(1);
 	multicore_lockout_start_blocking();
 	uint32_t interrupts = spin_lock_blocking(flashLock);
+	flashWriteStep(2);
 
 	flash_range_erase((intptr_t)EEPROM_ADDRESS_START - (intptr_t)XIP_BASE, EEPROM_SIZE_BYTES);
 	flash_range_program((intptr_t)EEPROM_ADDRESS_START - (intptr_t)XIP_BASE, reinterpret_cast<uint8_t *>(flashCache), EEPROM_SIZE_BYTES);
@@ -23,6 +28,7 @@ int64_t writeToFlash(alarm_id_t id, void *flashCache)
 
 	multicore_lockout_end_blocking();
 	spin_unlock(flashLock, interrupts);
+	flashWriteStep(3);
 
 	return 0;
 }
