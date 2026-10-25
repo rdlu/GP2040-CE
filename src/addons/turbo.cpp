@@ -77,6 +77,7 @@ void TurboInput::setup(){
         shmupBtnPin[2] = options.shmupBtn3Pin;
         shmupBtnPin[3] = options.shmupBtn4Pin;
         for (uint8_t i = 0; i < 4; i++) {
+            shmupBtnPinMask[i] = 0;
             if ( isValidPin(shmupBtnPin[i]) ) {
                 gpio_init(shmupBtnPin[i]);
                 gpio_set_dir(shmupBtnPin[i], GPIO_IN);
@@ -195,9 +196,11 @@ void TurboInput::process()
     // Get Charge Buttons
     if (options.shmupModeEnabled) {
         chargeState = 0;
+        // Charge pins are not button pins, so debouncedGpio does not have them
+        const Mask_t pressedGpios = Storage::getInstance().getPressedGpios();
         for (uint8_t i = 0; i < 4; i++) {
             if (shmupBtnPinMask[i] > 0) { // if pin, get the GPIO
-                chargeState |= (!(gamepad->debouncedGpio & shmupBtnPinMask[i]) ? shmupBtnMask[i] : 0);
+                chargeState |= ((pressedGpios & shmupBtnPinMask[i]) ? shmupBtnMask[i] : 0);
             }
         }
     }
