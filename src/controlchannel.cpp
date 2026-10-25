@@ -40,7 +40,7 @@ constexpr uint8_t REQ_CODE     = 0x47;
 constexpr uint8_t INDEX_MAGIC  = 0x50;
 
 constexpr uint8_t PROTO_MAJOR = 1;
-constexpr uint8_t PROTO_MINOR = 13;
+constexpr uint8_t PROTO_MINOR = 14;
 
 constexpr uint16_t MAX_LEN    = 64;
 constexpr uint16_t HEADER_LEN = 8;
@@ -73,7 +73,8 @@ constexpr uint32_t SCAN_TIMEOUT_MS = 10000;
 constexpr uint16_t COLORS_HEAD_LEN = 4;
 static_assert(COLORS_HEAD_LEN + 3 * MAX_CUSTOM_COLORS <= MAX_LEN);
 
-// READ_KEYMAP reply and WRITE_KEYMAP argument: a 4-byte head, then a keycode for each KeyboardMapping field
+// READ_KEYMAP reply and WRITE_KEYMAP argument: a 4-byte head, then a keycode for each KeyboardMapping field.
+// Head byte 2 is the profile: 0 the active one, 1 the base mapping, 2 to 6 that profile
 constexpr uint16_t KEYMAP_HEAD_LEN = 4;
 constexpr uint8_t  KEYMAP_KEYS     = 32;
 static_assert(KEYMAP_HEAD_LEN + KEYMAP_KEYS <= MAX_LEN);
@@ -154,11 +155,13 @@ enum Capability : uint32_t {
     CAP_ONE_BOOT_MODE   = 1u << 18,
     CAP_INPUT_OPTIONS   = 1u << 19,
     CAP_DIAG            = 1u << 20,
+    CAP_PROFILE_KEYMAP  = 1u << 21,
 };
 
 constexpr uint32_t CAPABILITIES = CAP_STATUS | CAP_STRING | CAP_SET_PROFILE | CAP_REBOOT | CAP_SET_INPUT_MODE | CAP_SLOTS |
                                   CAP_CONFIG | CAP_INPUT | CAP_LOG | CAP_KEYMAP | CAP_HOTKEYS |
-                                  CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS | CAP_DIAG;
+                                  CAP_ONE_BOOT_MODE | CAP_INPUT_OPTIONS | CAP_DIAG |
+                                  CAP_PROFILE_KEYMAP;
 
 // The modes DriverManager::setup() can start
 constexpr uint32_t BOOTABLE_MODES =
@@ -942,23 +945,48 @@ inline bool keycodeValid(uint8_t code) {
            (code >= KEYBOARD_MULTIMEDIA_STOP && code <= KEYBOARD_MULTIMEDIA_VOLUME_DOWN);
 }
 
-uint16_t buildKeymap() {
+// Profile 0 becomes the number of the active profile
+KeyboardMapping *profileKeymap(uint8_t &profile) {
+    Storage &storage = Storage::getInstance();
+    ProfileOptions &options = storage.getProfileOptions();
+    if (profile == 0) {
+        KeyboardMapping *active = &storage.getActiveKeyboardMapping();
+        profile = 1;
+        for (pb_size_t i = 0; i < options.gpioMappingsSets_count; i++) {
+            if (active == &options.gpioMappingsSets[i].keyboardMapping) profile = i + 2;
+        }
+        return active;
+    }
+    if (profile == 1) return &storage.getKeyboardMapping();
+    if (profile >= 2 && profile - 2 < options.gpioMappingsSets_count) return &options.gpioMappingsSets[profile - 2].keyboardMapping;
+    return nullptr;
+}
+
+bool buildKeymap(uint16_t wValue, uint16_t *len) {
+    if (wValue > UINT8_MAX) return false;
+    uint8_t profile = wValue;
+    KeyboardMapping *keymap = profileKeymap(profile);
+    if (keymap == nullptr) return false;
     pb_field_iter_t field;
     uint8_t count = 0;
-    if (pb_field_iter_begin(&field, KeyboardMapping_fields, &Storage::getInstance().getKeyboardMapping())) {
+    if (pb_field_iter_begin(&field, KeyboardMapping_fields, keymap)) {
         do buffer[KEYMAP_HEAD_LEN + count++] = (uint8_t)*(const uint32_t *)field.pData;
         while (count < KEYMAP_KEYS && pb_field_iter_next(&field));
     }
     buffer[0] = count;
     buffer[1] = 0;
-    put16(buffer + 2, 0);
-    return KEYMAP_HEAD_LEN + count;
+    buffer[2] = profile;
+    buffer[3] = 0;
+    *len = KEYMAP_HEAD_LEN + count;
+    return true;
 }
 
 uint8_t doWriteKeymap(const uint8_t *arg, uint16_t argLen) {
     if (argLen < KEYMAP_HEAD_LEN) return RES_BAD_LENGTH;
     const uint8_t count = arg[0], flags = arg[1];
-    if (count != KEYMAP_KEYS || (flags & ~SLOT_PERSIST) || get16(arg + 2) != 0) return RES_BAD_ARG;
+    uint8_t profile = arg[2];
+    KeyboardMapping *keymap = profileKeymap(profile);
+    if (count != KEYMAP_KEYS || (flags & ~SLOT_PERSIST) || keymap == nullptr || arg[3] != 0) return RES_BAD_ARG;
     if (argLen < KEYMAP_HEAD_LEN + count) return RES_BAD_LENGTH;
     const uint8_t *keys = arg + KEYMAP_HEAD_LEN;
     for (uint8_t i = 0; i < count; i++) {
@@ -968,7 +996,8 @@ uint8_t doWriteKeymap(const uint8_t *arg, uint16_t argLen) {
     // KeyboardDriver reads the mapping for each report
     pb_field_iter_t field;
     uint8_t i = 0;
-    if (pb_field_iter_begin(&field, KeyboardMapping_fields, &Storage::getInstance().getKeyboardMapping())) {
+    if (profile >= 2) Storage::getInstance().getProfileOptions().gpioMappingsSets[profile - 2].has_keyboardMapping = true;
+    if (pb_field_iter_begin(&field, KeyboardMapping_fields, keymap)) {
         do {
             *(uint32_t *)field.pData = keys[i++];
             *(bool *)field.pSize = true;
@@ -1167,7 +1196,7 @@ bool ControlChannel::handle(uint8_t rhport, uint8_t stage, tusb_control_request_
             case CMD_READ_CONFIG: if (!buildConfig(request->wValue, request->wLength, &len)) return false; break;
             case CMD_READ_INPUT: len = buildInput(); break;
             case CMD_READ_CUSTOM_COLORS: if (!buildCustomColors(&len)) return false; break;
-            case CMD_READ_KEYMAP: len = buildKeymap(); break;
+            case CMD_READ_KEYMAP: if (!buildKeymap(request->wValue, &len)) return false; break;
             case CMD_READ_HOTKEYS: len = buildHotkeys(); break;
             case CMD_READ_INPUT_OPTIONS: len = buildInputOptions(); break;
             case CMD_READ_LOG: if (request->wLength < LOG_HEAD_LEN) return false; len = buildLog(request->wValue, request->wLength); break;
