@@ -131,6 +131,19 @@ void TurboInput::process()
     uint16_t buttonsPressed = gamepad->state.buttons & TURBO_BUTTON_MASK;
     uint8_t dpadPressed = gamepad->state.dpad & GAMEPAD_MASK_DPAD;
 
+    if ((gamepad->debouncedGpio & turboPinMask) && !gamepad->state.buttons && !gamepad->state.dpad) {
+        const uint32_t now = getMillis();
+        if (menuHoldStart == 0) {
+            menuHoldStart = now | 1;
+        } else if (!menuHoldDone && now - menuHoldStart >= TURBO_MENU_HOLD_MS) {
+            menuHoldDone = true;
+            EventManager::getInstance().triggerEvent(new GPMenuNavigateEvent(GpioAction::MENU_NAVIGATION_TOGGLE));
+        }
+    } else {
+        menuHoldStart = 0;
+        menuHoldDone = false;
+    }
+
     if (!options.enabled) return;
 
     // Check if shotCount changed externally (e.g., via hotkey)

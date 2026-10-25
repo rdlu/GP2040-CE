@@ -17,6 +17,9 @@
 #define TURBO_SHOT_MIN 2
 #define TURBO_SHOT_MAX 30
 
+// Hold the Turbo pin alone this long to toggle the display menu
+#define TURBO_MENU_HOLD_MS 3000
+
 // TURBO Button Mask
 #define TURBO_BUTTON_MASK (GAMEPAD_MASK_B1 | GAMEPAD_MASK_B2 | GAMEPAD_MASK_B3 | GAMEPAD_MASK_B4 | \
                             GAMEPAD_MASK_L1 | GAMEPAD_MASK_R1 | GAMEPAD_MASK_L2 | GAMEPAD_MASK_R2)
@@ -125,6 +128,8 @@ private:
     uint32_t debChargeTime[4];  // Debounce Charge Button Time
     uint16_t lastPressed;       // Last buttons pressed (for Turbo Enable)
     uint8_t lastDpad;           // Last d-pad pressed (for Turbo Change)
+    uint32_t menuHoldStart = 0; // When the Turbo pin was pressed alone, 0 if not
+    bool menuHoldDone = false;  // The menu was toggled for this hold
     uint16_t turboButtonsMask;  // Turbo Buttons Enabled
     uint16_t alwaysEnabled;     // Turbo SHMUP Always Enabled
     uint32_t uIntervalUS;       // Turbo Interval in microseconds
